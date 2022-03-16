@@ -18,7 +18,7 @@ import torch
 from collections import defaultdict, Counter
 
 from auto_LiRPA.utils import stop_criterion_sum
-from branching_domains import pick_out_batch, add_domain_parallel, ReLUDomain, SortedList, DFS_SortedList, merge_domains_params
+from branching_domains import pick_out_batch, add_domain_parallel, ReLUDomain, SortedList, merge_domains_params
 from branching_heuristics import choose_node_parallel_FSB, choose_node_parallel_crown, choose_node_parallel_kFSB
 import arguments
 
@@ -50,9 +50,12 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate, layer_set_b
     domains_params = pick_out_batch(d, decision_thresh, batch=batch * (1 - dive_rate), device=net.x.device, DFS_percent=DFS_percent if DFS_enabled else 0)
     mask, lAs, orig_lbs, orig_ubs, slopes, betas, intermediate_betas, selected_domains = domains_params
 
+    print("lAs", lAs)
     pickout_time = time.time() - pickout_time
 
     if mask is not None:
+
+        print("Original mask", mask)
         decision_time = time.time()
 
         # print('history', selected_domains[0].history)
@@ -72,6 +75,8 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate, layer_set_b
                                             slopes=slopes, betas=betas, history=history)
         else:
             raise NotImplementedError
+
+        print("branching decision", branching_decision)
 
         if len(branching_decision) < len(mask[0]):
             print('all nodes are split!!')
@@ -106,6 +111,8 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate, layer_set_b
                                 split_history=split_history, layer_set_bound=layer_set_bound, betas=betas,
                                 single_node_split=single_node_split, intermediate_betas=intermediate_betas)
         dom_ub, dom_lb, dom_ub_point, lAs, dom_lb_all, dom_ub_all, slopes, split_history, betas, intermediate_betas, primals = ret
+
+
 
         if adv_pool is not None:
             adv_pool.add_adv_images(primals)
@@ -190,13 +197,14 @@ def relu_bab_parallel(net, domain, x, use_neuron_set_strategy=False, refined_low
         print("initial LP:", glb)
 
     if isinstance(global_lb, torch.Tensor):
+        print("global_lb", global_lb)
         global_lb = global_lb.item()
     if lp_test in ["LP", "MIP"]:
         return global_lb, global_ub, [[time.time()-start, global_lb]], 0
     # return global_lb, global_ub, [[time.time()-start, global_lb]], 0
 
-    print(global_lb)
     if global_lb > decision_thresh:
+        print("global lb is bigger than decision thresh ({} > {})".format(global_lb, decision_thresh))
         return global_lb, global_ub, [[time.time()-start, global_lb]], 0
 
     if True:
@@ -210,9 +218,9 @@ def relu_bab_parallel(net, domain, x, use_neuron_set_strategy=False, refined_low
 
     # This is the first (initial) domain.
     candidate_domain = ReLUDomain(lA, global_lb, global_ub, lower_bounds, upper_bounds, slope, history=history, depth=0, primals=primals).to_cpu()
-    domains = DFS_SortedList() if DFS_percent > 0 else SortedList()
+    domains = SortedList()
     domains.add(candidate_domain)
-
+    print("INIT domain", domains)
     tot_ambi_nodes = 0
     for i, layer_mask in enumerate(updated_mask):
         n_unstable = int(torch.sum(layer_mask).item())
