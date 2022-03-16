@@ -14,6 +14,7 @@
 import bisect
 import copy
 from collections import defaultdict
+import logging
 import torch
 import numpy as np
 from sortedcontainers import SortedList
@@ -86,6 +87,19 @@ class ReLUDomain:
         # z: stable relus have -1, others all unstable neuron from 0 to 1
         self.primals = primals
         self.priority = priority  # Higher priority will be more likely to be selected.
+
+    def __repr__(self):
+        result = "\t\n=======ReLUDomain========\n"
+        result+="\tPriority:\n\t"+str(self.priority)
+        result+="\n"
+        result+="\tLower bound:\n\t"+str(self.lower_bound)
+        result+="\n"
+        result += "\tHistory:\n\t"+str(self.history)
+        result += "\n"
+        result += "\tSplit History:\n\t"+str(self.split_history)
+        result += "\n"
+        return result
+
 
     def __lt__(self, other):
         if self.priority == other.priority:
@@ -226,27 +240,6 @@ class ReLUDomain:
         return dive_d
 
 
-class DFS_ReLUDomain:
-    def __init__(self, domain):
-        # refer DFS_ReLUDomain to the original ReLUDomain but rewrite the compare function by depth
-        self.domain = domain
-
-    def __lt__(self, other):
-        if self.domain.depth != other.domain.depth:
-            return self.domain.depth > other.domain.depth
-        else:
-            return self.domain.lower_bound < other.domain.lower_bound
-
-    def __le__(self, other):
-        if self.domain.depth != other.domain.depth:
-            return self.domain.depth > other.domain.depth
-        else:
-            return self.domain.lower_bound <= other.domain.lower_bound
-
-    def __eq__(self, other):
-        return self.domain.lower_bound == other.domain.lower_bound and self.domain.depth == other.domain.depth
-
-
 def add_domain(candidate, domains):
     """
     Use binary search to add the new domain `candidate`
@@ -354,6 +347,8 @@ def add_domain_parallel(lA, lb, ub, lb_all, up_all, domains, selected_domains, s
                 # bisect.insort_left(domains, right)
                 domains.add(right)
 
+    print("Done add_domain_parallel")
+
     return unsat_list
 
 
@@ -407,28 +402,10 @@ def pick_out_batch(domains, threshold, batch, device='cuda', DFS_percent=0, divi
 
     Returns: Non prunable CandidateDomain with the lowest reference_value.
     """
+    print("In Pick_out_batch, dfs_percent:{}".format(DFS_percent))
+    print("domains:{}".format(domains))
+
     assert batch > 0
-    DFS_batch = int(DFS_percent * min(batch, len(domains)))
-    if DFS_batch > 0:
-        tmp_d = []
-        idx = 0
-        while True:
-            if idx == len(domains.sublist):
-                break  # reach to end of the domains
-
-            d = domains.sublist.pop(0)  # domains.sublist is already sorted by depth
-
-            if d.domain.valid is True:
-                tmp_d.append(d.domain)
-                # will set d.domain.valid = False later in the recursive pick_out_batch()
-                idx += 1
-
-            if DFS_batch == idx:
-                break  # we collected enough domains by DFS
-
-        DFS_ret = pick_out_batch(tmp_d, threshold, idx, device, DFS_percent=0)
-        batch -= idx
-
     if torch.cuda.is_available(): torch.cuda.synchronize()  # make sure GPU to CPU transfer is finished
 
     idx, idx2 = 0, 0
@@ -508,32 +485,6 @@ def pick_out_batch(domains, threshold, batch, device='cuda', DFS_percent=0, divi
     for j in range(len(lower_bounds) - 1):  # Exclude the final output layer.
         new_masks.append(torch.logical_and(lower_bounds[j] < 0, upper_bounds[j] > 0).view(lower_bounds[0].size(0), -1).float())
 
-    if DFS_batch > 0:
-        DFS_masks = []
-        for j in range(len(new_masks)):
-            DFS_masks.append(torch.cat([DFS_ret[0][j], new_masks[j]]))
-
-        DFS_lAs = []
-        for j in range(len(new_lAs)):
-            DFS_lAs.append(torch.cat([DFS_ret[1][j], new_lAs[j]]))
-
-        DFS_lower_bounds = []
-        for j in range(len(lower_bounds)):
-            DFS_lower_bounds.append(torch.cat([DFS_ret[2][j], lower_bounds[j]]))
-
-        DFS_upper_bounds = []
-        for j in range(len(upper_bounds)):
-            DFS_upper_bounds.append(torch.cat([DFS_ret[3][j], upper_bounds[j]]))
-
-        DFS_slopes = DFS_ret[4] + slopes
-
-        DFS_betas_all = DFS_ret[5] + betas_all
-
-        DFS_intermediate_betas_all = DFS_ret[6] + intermediate_betas_all
-
-        DFS_selected_candidate_domains = DFS_ret[7] + selected_candidate_domains
-
-        return DFS_masks, DFS_lAs, DFS_lower_bounds, DFS_upper_bounds, DFS_slopes, DFS_betas_all, DFS_intermediate_betas_all, DFS_selected_candidate_domains
     return new_masks, new_lAs, lower_bounds, upper_bounds, slopes, betas_all, intermediate_betas_all, selected_candidate_domains
 
 
@@ -551,19 +502,6 @@ def prune_domains(domains, threshold):
             domains = domains[0:i]
             break
     return domains
-
-
-class DFS_SortedList(SortedList):
-    def __init__(self, iterable=None, key=None):
-        super().__init__(iterable=iterable, key=key)
-        self.sublist = SortedList()  # initial a SortedList to save domains sorted by depth
-
-    def add(self, value):
-        super().add(value=value)  # ReLUDomain wii be sorted by lowerbound
-        self.sublist.add(DFS_ReLUDomain(value))  # DFS_ReLUDomain will be sorted by depth
-
-    def pop(self, index=-1):
-        return super().pop(index=index)
 
 
 def merge_domains_params(domains_params, dive_domains_params):
