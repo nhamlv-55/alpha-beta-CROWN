@@ -26,6 +26,8 @@ from auto_LiRPA.utils import reduction_sum, stop_criterion_sum, stop_criterion_m
 
 from lp_mip_solver import *
 
+FIXED_SPLIT = True
+
 
 total_func_time = total_prepare_time = total_bound_time = total_beta_bound_time = total_transfer_time = total_finalize_time = 0.0
 
@@ -63,6 +65,11 @@ class LiRPAConvNet:
         # (out) masks_ret: batch list -> relu layers list -> tensor(relu layer shape)
         # (out) slope: batch list -> relu layers list -> tensor(relu layer shape)
         """
+        print("--------------------------")
+        print("Computing lower bound for")
+        print("Split:{}".format(split))
+
+
         if history is None:
             history = []
         start = time.time()
@@ -70,6 +77,7 @@ class LiRPAConvNet:
         lp_test = arguments.Config["debug"]["lp_test"]
 
         if single_node_split:
+            print("Using single node split")
             ret = self.update_bounds_parallel(pre_lbs, pre_ubs, split, slopes, betas=betas, early_stop=False, history=history,
                                               layer_set_bound=layer_set_bound)
         else:
@@ -109,7 +117,8 @@ class LiRPAConvNet:
 
         end = time.time()
         print('batch bounding time: ', end - start)
-
+        print("Lower bound of this batch:")
+        print(lower_bounds)
         return [i[-1].item() for i in upper_bounds], [i[-1].item() for i in lower_bounds], None, lAs, lower_bounds, \
                upper_bounds, slopes, split_history, betas, best_intermediate_betas, primals
 
@@ -206,6 +215,7 @@ class LiRPAConvNet:
         lower_bounds.append(lb.view(1, -1).detach())
         upper_bounds.append(ub.view(1, -1).detach())
 
+        print(self.name_dict)
         return lower_bounds, upper_bounds, self.pre_relu_indices
 
 
@@ -215,12 +225,17 @@ class LiRPAConvNet:
         upper_bounds = []
 
         for layer in model.relus:
+            print("In get_candidate_parallel")
+            print("layer.inputs", layer.inputs)
             lower_bounds.append(layer.inputs[0].lower)
             upper_bounds.append(layer.inputs[0].upper)
 
         # Also add the bounds on the final thing
         lower_bounds.append(lb.view(batch + diving_batch, -1).detach())
         upper_bounds.append(ub.view(batch + diving_batch, -1).detach())
+
+        print("lower_bounds:\n", lower_bounds)
+
 
         return lower_bounds, upper_bounds
 
@@ -377,7 +392,10 @@ class LiRPAConvNet:
                     valid_betas = len(betas[bi][mi])
                     m.sparse_beta[bi, :valid_betas] = betas[bi][mi]
             # This is the beta variable to be optimized for this layer.
-            m.sparse_beta = m.sparse_beta.repeat(2, 1).detach().to(device=self.net.device, non_blocking=True).requires_grad_()
+            if FIXED_SPLIT:
+                m.sparse_beta = m.sparse_beta.detach().to(device=self.net.device, non_blocking=True).requires_grad_()
+            else:
+                m.sparse_beta = m.sparse_beta.repeat(2, 1).detach().to(device=self.net.device, non_blocking=True).requires_grad_()
             
             assert batch + diving_batch == len(betas)
             if diving_batch != 0:
@@ -424,7 +442,8 @@ class LiRPAConvNet:
             decision = np.array([i.squeeze() for i in decision])
 
         batch = len(decision)
-
+        print("batch", batch)
+        print("decision", decision)
         # initial results with empty list
         ret_l = [[] for _ in range(batch * 2 + diving_batch)]
         ret_u = [[] for _ in range(batch * 2 + diving_batch)]
@@ -474,18 +493,46 @@ class LiRPAConvNet:
                     if mi == d:
                         self.net.relus[mi].sparse_beta_sign[bi, split_len] = 1.0
                         self.net.relus[mi].sparse_beta_loc[bi, split_len] = idx
-            # Duplicate split location.
-            for m in self.net.relus:
-                m.sparse_beta_loc = m.sparse_beta_loc.repeat(2, 1).detach()
-                m.sparse_beta_loc = m.sparse_beta_loc.to(device=self.net.device, non_blocking=True)
-                m.sparse_beta_sign = m.sparse_beta_sign.repeat(2, 1).detach()
-            # Fixup the second half of the split (negative splits).
-            for bi in range(batch):
-                d = decision[bi][0]  # layer of this split.
-                split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
-                self.net.relus[d].sparse_beta_sign[bi + batch, split_len] = -1.0
+            """
+            Nham: here is where we enforce our mask
+            Strategy1: if a ReLU should be fixed, keep track of its index. Only use half of the output
+                       corresponding to the fixed half
+            Strategy2: if a ReLU should be fixed, then it is no longer duplicate. 
+                      Then we set the sign properly. We should find all instances when `torch.repeat` is used,
+                      then change it.
+
+            
+            """
+            if FIXED_SPLIT:
+                """
+                Nham: is a stable node, no duplication
+                """
+                SIGN = 1
+                for m in self.net.relus:
+                    m.sparse_beta_loc = m.sparse_beta_loc.to(
+                    device=self.net.device, non_blocking=True)
+                # Fixup it values
+                for bi in range(batch):
+                    d = decision[bi][0]  # layer of this split.
+                    split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
+                    self.net.relus[d].sparse_beta_sign[bi, split_len] = SIGN
+            else:
+                # Duplicate split location.
+                for m in self.net.relus:
+                    m.sparse_beta_loc = m.sparse_beta_loc.repeat(2, 1).detach()
+                    m.sparse_beta_loc = m.sparse_beta_loc.to(device=self.net.device, non_blocking=True)
+                    m.sparse_beta_sign = m.sparse_beta_sign.repeat(2, 1).detach()
+                # Fixup the second half of the split (negative splits).
+                for bi in range(batch):
+                    d = decision[bi][0]  # layer of this split.
+                    split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
+                    self.net.relus[d].sparse_beta_sign[bi + batch, split_len] = -1.0
             # Transfer tensors to GPU.
             for m in self.net.relus:
+                print(m)
+                print("S matrix location\n", m.sparse_beta_loc, m.sparse_beta_loc.shape)
+                print("S matrix\n", m.sparse_beta_sign, m.sparse_beta_sign.shape)
+
                 m.sparse_beta_sign = m.sparse_beta_sign.to(device=self.net.device, non_blocking=True)
 
             if diving_batch > 0:
@@ -508,41 +555,89 @@ class LiRPAConvNet:
                 m.beta = None
 
         # pre_ub_all[:-1] means pre-set bounds for all intermediate layers
-        with torch.no_grad():
-            # Setting the neuron upper/lower bounds with a split to 0.
-            zero_indices_batch = [[] for _ in range(len(pre_lb_all) - 1)]
-            zero_indices_neuron = [[] for _ in range(len(pre_lb_all) - 1)]
-            for i in range(batch):
-                d, idx = decision[i][0], decision[i][1]
-                # We save the batch, and neuron number for each split, and will set all corresponding elements in batch.
-                zero_indices_batch[d].append(i)
-                zero_indices_neuron[d].append(idx)
-            zero_indices_batch = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_batch]
-            zero_indices_neuron = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_neuron]
+        if FIXED_SPLIT:
+            with torch.no_grad():
+                print("pre_lb_all", pre_lb_all)
 
-            # 2 * batch + diving_batch
-            upper_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_ub_all[:-1]]
-            lower_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_lb_all[:-1]]
+                # Setting the neuron upper/lower bounds with a split to 0.
+                zero_indices_batch = [[] for _ in range(len(pre_lb_all) - 1)]
+                zero_indices_neuron = [[] for _ in range(len(pre_lb_all) - 1)]
+                for i in range(batch):
+                    d, idx = decision[i][0], decision[i][1]
+                    # We save the batch, and neuron number for each split, and will set all corresponding elements in batch.
+                    zero_indices_batch[d].append(i)
+                    zero_indices_neuron[d].append(idx)
+                zero_indices_batch = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_batch]
+                zero_indices_neuron = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_neuron]
 
-            # Only the last element is used later.
-            pre_lb_last = torch.cat([pre_lb_all[-1][:batch], pre_lb_all[-1][:batch], pre_lb_all[-1][batch:]])
-            pre_ub_last = torch.cat([pre_ub_all[-1][:batch], pre_ub_all[-1][:batch], pre_ub_all[-1][batch:]])
+                print(zero_indices_batch)
+                print(zero_indices_neuron)
 
-            new_candidate = {}
-            for d in range(len(lower_bounds)):
-                # for each layer except the last output layer
-                if len(zero_indices_batch[d]):
-                    # we set lower = 0 in first half batch, and upper = 0 in second half batch
-                    lower_bounds[d][:2 * batch].view(2 * batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
-                    upper_bounds[d][:2 * batch].view(2 * batch, -1)[zero_indices_batch[d] + batch, zero_indices_neuron[d]] = 0.0
-                new_candidate[self.name_dict[d]] = [lower_bounds[d], upper_bounds[d]]
+                # 2 * batch + diving_batch
+                upper_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_ub_all[:-1]]
+                lower_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_lb_all[:-1]]
+                print("in update_bounds_parallel", lower_bounds)
+                # Only the last element is used later.
+                pre_lb_last = torch.cat([pre_lb_all[-1][:batch], pre_lb_all[-1][batch:]])
+                pre_ub_last = torch.cat([pre_ub_all[-1][:batch], pre_ub_all[-1][batch:]])
+
+                new_candidate = {}
+                for d in range(len(lower_bounds)):
+                    # for each layer except the last output layer
+                    if len(zero_indices_batch[d]):
+                        # we set lower = 0 in first half batch, and upper = 0 in second half batch
+                        print("lbd", lower_bounds[d])
+                        print("lbd", lower_bounds[d][:batch])
+                        print("lbd", lower_bounds[d][:batch].view(batch, -1))
+                        lower_bounds[d][:batch].view(batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
+                        upper_bounds[d][:batch].view(batch, -1)[zero_indices_batch[d] + batch, zero_indices_neuron[d]] = 0.0
+                    new_candidate[self.name_dict[d]] = [lower_bounds[d], upper_bounds[d]]
+
+        else:            
+            with torch.no_grad():
+                # Setting the neuron upper/lower bounds with a split to 0.
+                zero_indices_batch = [[] for _ in range(len(pre_lb_all) - 1)]
+                zero_indices_neuron = [[] for _ in range(len(pre_lb_all) - 1)]
+                for i in range(batch):
+                    d, idx = decision[i][0], decision[i][1]
+                    # We save the batch, and neuron number for each split, and will set all corresponding elements in batch.
+                    zero_indices_batch[d].append(i)
+                    zero_indices_neuron[d].append(idx)
+                zero_indices_batch = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_batch]
+                zero_indices_neuron = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_neuron]
+
+                # 2 * batch + diving_batch
+                upper_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_ub_all[:-1]]
+                lower_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_lb_all[:-1]]
+
+                # Only the last element is used later.
+                pre_lb_last = torch.cat([pre_lb_all[-1][:batch], pre_lb_all[-1][:batch], pre_lb_all[-1][batch:]])
+                pre_ub_last = torch.cat([pre_ub_all[-1][:batch], pre_ub_all[-1][:batch], pre_ub_all[-1][batch:]])
+
+                new_candidate = {}
+                for d in range(len(lower_bounds)):
+                    # for each layer except the last output layer
+                    if len(zero_indices_batch[d]):
+                        # we set lower = 0 in first half batch, and upper = 0 in second half batch
+                        lower_bounds[d][:2 * batch].view(2 * batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
+                        upper_bounds[d][:2 * batch].view(2 * batch, -1)[zero_indices_batch[d] + batch, zero_indices_neuron[d]] = 0.0
+                    new_candidate[self.name_dict[d]] = [lower_bounds[d], upper_bounds[d]]
 
         # create new_x here since batch may change
-        ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
-                                 x_L=self.x.ptb.x_L.repeat(batch * 2 + diving_batch, 1, 1, 1),
-                                 x_U=self.x.ptb.x_U.repeat(batch * 2 + diving_batch, 1, 1, 1))
-        new_x = BoundedTensor(self.x.data.repeat(batch * 2 + diving_batch, 1, 1, 1), ptb)
-        c = None if self.c is None else self.c.repeat(new_x.shape[0], 1, 1)
+        if FIXED_SPLIT:
+            ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
+                                    x_L=self.x.ptb.x_L.repeat(batch + diving_batch, 1, 1, 1),
+                                    x_U=self.x.ptb.x_U.repeat(batch + diving_batch, 1, 1, 1))
+            new_x = BoundedTensor(self.x.data.repeat(batch + diving_batch, 1, 1, 1), ptb)
+            c = None if self.c is None else self.c.repeat(new_x.shape[0], 1, 1)
+            print("c")
+        else:
+            ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
+                                    x_L=self.x.ptb.x_L.repeat(batch * 2 + diving_batch, 1, 1, 1),
+                                    x_U=self.x.ptb.x_U.repeat(batch * 2 + diving_batch, 1, 1, 1))
+            new_x = BoundedTensor(self.x.data.repeat(batch * 2 + diving_batch, 1, 1, 1), ptb)
+            c = None if self.c is None else self.c.repeat(new_x.shape[0], 1, 1)
+
         # self.net(new_x)  # batch may change, so we need to do forward to set some shapes here
 
         if len(slopes) > 0:
@@ -556,6 +651,7 @@ class LiRPAConvNet:
             self.net.set_bound_opts({'optimize_bound_args': {'ob_beta': beta, 'ob_single_node_split': True,
                 'ob_update_by_layer': layer_set_bound, 'ob_optimizer':optimizer}})
             with torch.no_grad():
+                print(new_x.shape)
                 lb, _, = self.net.compute_bounds(x=(new_x,), IBP=False, C=c, method='backward',
                                                  new_interval=new_candidate, bound_upper=False, return_A=False)
             return lb
@@ -614,6 +710,7 @@ class LiRPAConvNet:
             lower_bounds_new, upper_bounds_new = self.get_candidate_parallel(transfer_net, lb, ub, batch * 2, diving_batch=diving_batch)
 
             lower_bounds_new[-1] = torch.max(lower_bounds_new[-1], pre_lb_last.cpu())
+            print("lower_bounds_new shape:\n", [tmp.shape for tmp in lower_bounds_new])
             if not get_upper_bound:
                 # Do not set to min so the primal is always corresponding to the upper bound.
                 upper_bounds_new[-1] = torch.min(upper_bounds_new[-1], pre_ub_last.cpu())
@@ -1129,6 +1226,9 @@ class LiRPAConvNet:
             lower_bounds_new[-1] = torch.max(lower_bounds_new[-1], pre_lb_all[-1].cpu())
             upper_bounds_new[-1] = torch.min(upper_bounds_new[-1], pre_ub_all[-1].cpu())
 
+
+
+
             lAs = self.get_lA_parallel(transfer_net)
 
             if len(slopes) > 0:
@@ -1474,7 +1574,8 @@ class LiRPAConvNet:
         lr_decay = arguments.Config["solver"]["beta-crown"]["lr_decay"]
         loss_reduction_func = arguments.Config["general"]["loss_reduction_func"]
         get_upper_bound = arguments.Config["bab"]["get_upper_bound"]
-        
+
+
         self.x = x
         self.input_domain = input_domain
 
@@ -1485,7 +1586,7 @@ class LiRPAConvNet:
         # first get CROWN bounds
         # Reference bounds are intermediate layer bounds from initial CROWN bounds.
         lb, ub, aux_reference_bounds = self.net.init_slope((self.x,), share_slopes=share_slopes, c=self.c, bound_upper=False)
-        print('initial CROWN bounds:', lb, ub)
+        print('initial CROWNNNN bounds:', lb, ub)
         if stop_criterion_func(lb).all().item():
             # Fast path. Initial CROWN bound can verify the network.
             if not self.simplify:
@@ -1672,3 +1773,12 @@ class LiRPAConvNet:
     def build_the_model_mip_refine(m, lower_bounds, upper_bounds, stop_criterion_func=stop_criterion_min(1e-4), score=None, FSB_sort=True, topk_filter=1.):
             # using mip solver to refine the bounds of intermediate nodes
             return  build_the_model_mip_refine(m, lower_bounds, upper_bounds, stop_criterion_func, score, FSB_sort, topk_filter)
+
+    def visualize(self):
+        return
+        print("visualizing internal state")
+        relu_layers = []
+        for layer in self.net.children():
+            if isinstance(layer, BoundRelu):
+                print(layer)
+                relu_layers.append(layer)
