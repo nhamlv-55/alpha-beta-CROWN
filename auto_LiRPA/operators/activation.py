@@ -1,5 +1,10 @@
 """ Activation operators or other unary nonlinear operators"""
 from .base import *
+# FIXED_SPLIT = False
+FIXED_SPLIT = True
+
+SIGN = 1
+
 
 class BoundActivation(Bound):
     def __init__(self, input_name, name, ori_name, attr, inputs, output_index, options, device):
@@ -295,7 +300,6 @@ class BoundRelu(BoundOptimizableActivation):
                          k=lower_k, x0=0., y0=0.)
 
     def bound_backward(self, last_lA, last_uA, x=None, start_node=None, beta_for_intermediate_layers=False, unstable_idx=None):
-        print("in bound_backward, last_lA", last_lA)
         if x is not None:
             # # only set lower and upper bound here when using neuron set version, ie, not ob_update_by_layer
             # if self.beta is not None and not self.options.get('optimize_bound_args', {}).get('ob_update_by_layer', False):
@@ -337,6 +341,7 @@ class BoundRelu(BoundOptimizableActivation):
         elif self.relu_options == "reversed-adaptive":
             lower_d = (upper_d < 0.5).float()
         elif self.opt_stage == 'opt':
+            # breakpoint()
             # Alpha-CROWN.
             lower_d = None
             # Each alpha has shape (2, output_shape, batch_size, *relu_node_shape].
@@ -374,6 +379,7 @@ class BoundRelu(BoundOptimizableActivation):
                 upper = self.upper
             lower_mask = lower > 0
             upper_mask = upper < 0
+            # breakpoint()
             if last_lA is not None:
                 lb_lower_d = selected_alpha[0].clamp(min=0.0, max=1.0)
                 lb_lower_d[:, lower_mask] = 1.0
@@ -446,8 +452,6 @@ class BoundRelu(BoundOptimizableActivation):
                 # neg_A = last_A.clamp(max=0)
                 # pos_A = last_A.clamp(min=0)
                 # A = d_pos * pos_A + d_neg * neg_A
-                print(last_A)
-
 
                 A, pos_A, neg_A = self.clamp_mutiply(last_A, d_pos, d_neg)
                 bias = 0
@@ -542,7 +546,6 @@ class BoundRelu(BoundOptimizableActivation):
                         lA = lA.view(prev_size)
                 else:
                     raise RuntimeError(f"Unknown type {type(A)} for A")
-            # The code block below is for debugging and will be removed (until the end of this function).
         return [(lA, uA)], lbias, ubias
 
     def interval_propagate(self, *v):

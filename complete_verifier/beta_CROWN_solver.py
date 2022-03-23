@@ -23,11 +23,8 @@ from auto_LiRPA import BoundedModule, BoundedTensor
 from auto_LiRPA.bound_ops import BoundRelu
 from auto_LiRPA.perturbations import *
 from auto_LiRPA.utils import reduction_sum, stop_criterion_sum, stop_criterion_min
-
+from auto_LiRPA.operators.activation import FIXED_SPLIT, SIGN
 from lp_mip_solver import *
-
-FIXED_SPLIT = True
-
 
 total_func_time = total_prepare_time = total_bound_time = total_beta_bound_time = total_transfer_time = total_finalize_time = 0.0
 
@@ -279,15 +276,29 @@ class LiRPAConvNet:
 
     def get_beta(self, model, splits_per_example, diving_batch=0):
         # split_per_example only has half of the examples.
+
+
+
         batch = splits_per_example.size(0) - diving_batch
-        retb = [[] for i in range(batch * 2 + diving_batch)]
-        for mi, m in enumerate(model.relus):
-            for i in range(batch):
-                # Save only used beta, discard padding beta.
-                retb[i].append(m.sparse_beta[i, :splits_per_example[i, mi]])
-                retb[i + batch].append(m.sparse_beta[i + batch, :splits_per_example[i, mi]])
-            for i in range(diving_batch):
-                retb[2 * batch + i].append(m.sparse_beta[2 * batch + i, :splits_per_example[batch + i, mi]])
+        print(">>>>>>batch", batch)
+        if FIXED_SPLIT:
+            retb = [[] for i in range(batch + diving_batch)]
+            for mi, m in enumerate(model.relus):
+                for i in range(batch):
+                    # Save only used beta, discard padding beta.
+                    retb[i].append(m.sparse_beta[i, :splits_per_example[i, mi]])
+                for i in range(diving_batch):
+                    retb[batch + i].append(m.sparse_beta[batch + i, :splits_per_example[batch + i, mi]])
+
+        else:
+            retb = [[] for i in range(batch * 2 + diving_batch)]
+            for mi, m in enumerate(model.relus):
+                for i in range(batch):
+                    # Save only used beta, discard padding beta.
+                    retb[i].append(m.sparse_beta[i, :splits_per_example[i, mi]])
+                    retb[i + batch].append(m.sparse_beta[i + batch, :splits_per_example[i, mi]])
+                for i in range(diving_batch):
+                    retb[2 * batch + i].append(m.sparse_beta[2 * batch + i, :splits_per_example[batch + i, mi]])
         return retb
 
 
@@ -308,7 +319,7 @@ class LiRPAConvNet:
         return ret
 
 
-    def set_slope(self, model, slope, intermediate_refinement_layers=None, diving_batch=0):
+    def set_slope(self, model, slope, intermediate_refinement_layers=None, diving_batch=0, should_duplicate = True):
         cleanup_intermediate_slope = isinstance(intermediate_refinement_layers, list) and len(intermediate_refinement_layers) == 0
         if cleanup_intermediate_slope:
             # Clean all intermediate betas if we are not going to refine intermeidate layer neurons anymore.
@@ -338,7 +349,9 @@ class LiRPAConvNet:
                                 # Merge all slope vectors together in this batch. Size is (2, spec, batch, *shape).
                                 m.alpha[spec_name] = torch.cat([slope[i][m.name][spec_name] for i in range(len(slope) - diving_batch)], dim=2)
                                 # Duplicate for the second half of the batch.
-                                m.alpha[spec_name] = m.alpha[spec_name].repeat(1, 1, 2, *([1] * (m.alpha[spec_name].ndim - 3))).detach().requires_grad_()
+                                """Nham: looks like A is duplicate here"""
+                                if should_duplicate:
+                                    m.alpha[spec_name] = m.alpha[spec_name].repeat(1, 1, 2, *([1] * (m.alpha[spec_name].ndim - 3))).detach().requires_grad_()
                             if diving_batch > 0:
                                 # create diving alpha
                                 diving_alpha = torch.cat([slope[i][m.name][spec_name] for i in range(len(slope) - diving_batch, len(slope))], dim=2)
@@ -444,13 +457,26 @@ class LiRPAConvNet:
         batch = len(decision)
         print("batch", batch)
         print("decision", decision)
+        print("beta", beta)
         # initial results with empty list
-        ret_l = [[] for _ in range(batch * 2 + diving_batch)]
-        ret_u = [[] for _ in range(batch * 2 + diving_batch)]
-        ret_s = [[] for _ in range(batch * 2 + diving_batch)]
-        ret_b = [[] for _ in range(batch * 2 + diving_batch)]
-        new_split_history = [{} for _ in range(batch * 2 + diving_batch)]
-        best_intermediate_betas = [defaultdict(dict) for _ in range(batch * 2 + diving_batch)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
+
+        if FIXED_SPLIT and beta:
+            ret_l = [[] for _ in range(batch + diving_batch)]
+            ret_u = [[] for _ in range(batch + diving_batch)]
+            ret_s = [[] for _ in range(batch + diving_batch)]
+            ret_b = [[] for _ in range(batch + diving_batch)]
+            new_split_history = [{} for _ in range(batch + diving_batch)]
+            best_intermediate_betas = [defaultdict(dict) for _ in range(batch + diving_batch)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
+
+
+        else:
+
+            ret_l = [[] for _ in range(batch * 2 + diving_batch)]
+            ret_u = [[] for _ in range(batch * 2 + diving_batch)]
+            ret_s = [[] for _ in range(batch * 2 + diving_batch)]
+            ret_b = [[] for _ in range(batch * 2 + diving_batch)]
+            new_split_history = [{} for _ in range(batch * 2 + diving_batch)]
+            best_intermediate_betas = [defaultdict(dict) for _ in range(batch * 2 + diving_batch)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
 
         start_prepare_time = time.time()
         # iteratively change upper and lower bound from former to later layer
@@ -507,10 +533,10 @@ class LiRPAConvNet:
                 """
                 Nham: is a stable node, no duplication
                 """
-                SIGN = 1
                 for m in self.net.relus:
                     m.sparse_beta_loc = m.sparse_beta_loc.to(
                     device=self.net.device, non_blocking=True)
+                    m.sparse_beta_sign = m.sparse_beta_sign.detach()
                 # Fixup it values
                 for bi in range(batch):
                     d = decision[bi][0]  # layer of this split.
@@ -535,6 +561,7 @@ class LiRPAConvNet:
 
                 m.sparse_beta_sign = m.sparse_beta_sign.to(device=self.net.device, non_blocking=True)
 
+            #Nham: DEADCODE
             if diving_batch > 0:
                 # add diving domains history splits, no decision in diving domains
                 for dbi in range(diving_batch):
@@ -555,7 +582,7 @@ class LiRPAConvNet:
                 m.beta = None
 
         # pre_ub_all[:-1] means pre-set bounds for all intermediate layers
-        if FIXED_SPLIT:
+        if FIXED_SPLIT and beta:
             with torch.no_grad():
                 print("pre_lb_all", pre_lb_all)
 
@@ -574,12 +601,15 @@ class LiRPAConvNet:
                 print(zero_indices_neuron)
 
                 # 2 * batch + diving_batch
-                upper_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_ub_all[:-1]]
-                lower_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_lb_all[:-1]]
+                upper_bounds = [i[:batch] for i in pre_ub_all[:-1]]
+                lower_bounds = [i[:batch] for i in pre_lb_all[:-1]]
                 print("in update_bounds_parallel", lower_bounds)
                 # Only the last element is used later.
                 pre_lb_last = torch.cat([pre_lb_all[-1][:batch], pre_lb_all[-1][batch:]])
                 pre_ub_last = torch.cat([pre_ub_all[-1][:batch], pre_ub_all[-1][batch:]])
+
+
+                # breakpoint()
 
                 new_candidate = {}
                 for d in range(len(lower_bounds)):
@@ -589,8 +619,14 @@ class LiRPAConvNet:
                         print("lbd", lower_bounds[d])
                         print("lbd", lower_bounds[d][:batch])
                         print("lbd", lower_bounds[d][:batch].view(batch, -1))
-                        lower_bounds[d][:batch].view(batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
-                        upper_bounds[d][:batch].view(batch, -1)[zero_indices_batch[d] + batch, zero_indices_neuron[d]] = 0.0
+
+                        #Nham: If we do not split RELU here, only lower_bound or upper_bound should be updated
+                        if SIGN:
+                            #Nham: Fix the ReLU to be positive, so only need to change lower bound to be 0
+                            lower_bounds[d][:batch].view(batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
+                        else:
+                            #Nham: Fix the ReLU to be negative, so only need to update upper bound to be 0
+                            upper_bounds[d][:batch].view(batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
                     new_candidate[self.name_dict[d]] = [lower_bounds[d], upper_bounds[d]]
 
         else:            
@@ -607,6 +643,9 @@ class LiRPAConvNet:
                 zero_indices_neuron = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_neuron]
 
                 # 2 * batch + diving_batch
+                print("in update bound parallel pre_ub_all ", pre_ub_all[:-1])
+                print("batch", batch)
+                print("************************")
                 upper_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_ub_all[:-1]]
                 lower_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_lb_all[:-1]]
 
@@ -615,6 +654,9 @@ class LiRPAConvNet:
                 pre_ub_last = torch.cat([pre_ub_all[-1][:batch], pre_ub_all[-1][:batch], pre_ub_all[-1][batch:]])
 
                 new_candidate = {}
+
+                # breakpoint()
+
                 for d in range(len(lower_bounds)):
                     # for each layer except the last output layer
                     if len(zero_indices_batch[d]):
@@ -622,9 +664,9 @@ class LiRPAConvNet:
                         lower_bounds[d][:2 * batch].view(2 * batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
                         upper_bounds[d][:2 * batch].view(2 * batch, -1)[zero_indices_batch[d] + batch, zero_indices_neuron[d]] = 0.0
                     new_candidate[self.name_dict[d]] = [lower_bounds[d], upper_bounds[d]]
-
+                # breakpoint()
         # create new_x here since batch may change
-        if FIXED_SPLIT:
+        if FIXED_SPLIT and beta:
             ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
                                     x_L=self.x.ptb.x_L.repeat(batch + diving_batch, 1, 1, 1),
                                     x_U=self.x.ptb.x_U.repeat(batch + diving_batch, 1, 1, 1))
@@ -641,8 +683,12 @@ class LiRPAConvNet:
         # self.net(new_x)  # batch may change, so we need to do forward to set some shapes here
 
         if len(slopes) > 0:
+            if FIXED_SPLIT and beta:
+                should_duplicate = False
+            else:
+                should_duplicate = True
             # set slope here again
-            self.set_slope(self.net, slopes, diving_batch=diving_batch)
+            self.set_slope(self.net, slopes, diving_batch=diving_batch, should_duplicate=should_duplicate)
 
         prepare_time += time.time() - start_prepare_time
         start_bound_time = time.time()
@@ -707,7 +753,10 @@ class LiRPAConvNet:
                 ret_b = self.get_beta(transfer_net, splits_per_example, diving_batch=diving_batch)
 
             # Reorganize tensors.
-            lower_bounds_new, upper_bounds_new = self.get_candidate_parallel(transfer_net, lb, ub, batch * 2, diving_batch=diving_batch)
+            if FIXED_SPLIT and beta:
+                lower_bounds_new, upper_bounds_new = self.get_candidate_parallel(transfer_net, lb, ub, batch, diving_batch=diving_batch)
+            else:
+                lower_bounds_new, upper_bounds_new = self.get_candidate_parallel(transfer_net, lb, ub, batch * 2, diving_batch=diving_batch)
 
             lower_bounds_new[-1] = torch.max(lower_bounds_new[-1], pre_lb_last.cpu())
             print("lower_bounds_new shape:\n", [tmp.shape for tmp in lower_bounds_new])
@@ -715,15 +764,25 @@ class LiRPAConvNet:
                 # Do not set to min so the primal is always corresponding to the upper bound.
                 upper_bounds_new[-1] = torch.min(upper_bounds_new[-1], pre_ub_last.cpu())
             # reshape the results based on batch.
-            for i in range(batch):
-                ret_l[i] = [j[i:i + 1] for j in lower_bounds_new]
-                ret_l[i + batch] = [j[i + batch:i + batch + 1] for j in lower_bounds_new]
 
-                ret_u[i] = [j[i:i + 1] for j in upper_bounds_new]
-                ret_u[i + batch] = [j[i + batch:i + batch + 1] for j in upper_bounds_new]
-            for i in range(2 * batch, 2 * batch + diving_batch):
-                ret_l[i] = [j[i:i + 1] for j in lower_bounds_new]
-                ret_u[i] = [j[i:i + 1] for j in upper_bounds_new]
+            if FIXED_SPLIT:
+                for i in range(batch):
+                    ret_l[i] = [j[i:i + 1] for j in lower_bounds_new]
+                    ret_u[i] = [j[i:i + 1] for j in upper_bounds_new]
+                for i in range(batch, batch + diving_batch):
+                    ret_l[i] = [j[i:i + 1] for j in lower_bounds_new]
+                    ret_u[i] = [j[i:i + 1] for j in upper_bounds_new]
+            else:
+                for i in range(batch):
+                    ret_l[i] = [j[i:i + 1] for j in lower_bounds_new]
+                    ret_l[i + batch] = [j[i + batch:i + batch + 1] for j in lower_bounds_new]
+
+                    ret_u[i] = [j[i:i + 1] for j in upper_bounds_new]
+                    ret_u[i + batch] = [j[i + batch:i + batch + 1] for j in upper_bounds_new]
+                for i in range(2 * batch, 2 * batch + diving_batch):
+                    ret_l[i] = [j[i:i + 1] for j in lower_bounds_new]
+                    ret_u[i] = [j[i:i + 1] for j in upper_bounds_new]
+
 
             finalize_time = time.time() - start_finalize_time
 
@@ -752,702 +811,6 @@ class LiRPAConvNet:
 
         # assert (ret_p[1]['p'][0][0] == primal_x[1]).all()
         return ret_l, ret_u, lAs, ret_s, ret_b, new_split_history, best_intermediate_betas, primal_x
-
-
-    def update_bounds_parallel_general(self, pre_lb_all=None, pre_ub_all=None, split=None, 
-                            slopes=None, early_stop=True, split_history=None, history=None, 
-                            intermediate_betas=None, layer_set_bound=True, debug=False):
-
-        beta = arguments.Config["solver"]["beta-crown"]["beta"]
-        optimizer = arguments.Config["solver"]["beta-crown"]["optimizer"]
-        iteration = arguments.Config["solver"]["beta-crown"]["iteration"]
-        lr_alpha = arguments.Config["solver"]["beta-crown"]["lr_alpha"]
-        lr_beta = arguments.Config["solver"]["beta-crown"]["lr_beta"]
-        lr_intermediate_beta = arguments.Config["solver"]["intermediate_refinement"]["lr"]
-        beta_warmup = arguments.Config["solver"]["beta-crown"]["beta_warmup"]
-        opt_coeffs = arguments.Config["solver"]["intermediate_refinement"]["opt_coeffs"]
-        opt_bias = arguments.Config["solver"]["intermediate_refinement"]["opt_bias"]
-        opt_intermediate_beta = arguments.Config["solver"]["intermediate_refinement"]["enabled"]
-        intermediate_refinement_layers = arguments.Config["solver"]["intermediate_refinement"]["layers"]
-        
-        if not hasattr(self, '_count'):  # for debugging.
-            self._count = 0
-        self._count += 1
-        if self._count < 1:
-            opt_intermediate_beta = False
-            layer_set_bound = True
-        global total_func_time, total_bound_time, total_prepare_time, total_beta_bound_time, total_transfer_time, total_finalize_time
-        func_time = time.time()
-        prepare_time = bound_time = transfer_time = finalize_time = beta_bound_time = 0.0
-
-        if split_history is None:
-            split_history = []
-        if history is None:
-            history = []
-        device = self.net.device
-
-        # update optimize-CROWN bounds in a parallel way
-        batch = len(split["decision"])
-
-        # if any node in a layer is involved, it counts one constraint in this layer
-        num_constr = [[0 for _ in range(2 * batch)] for _ in range(len(self.net.relus))]
-
-        # A dictionary for converting node name to index.
-        relu_node2idx = {}
-        for i, m in enumerate(self.net.relus):
-            relu_node2idx[m.name] = i
-
-        # layers_need_change: keeps the smallest layer that involved in each batch
-        # list (total_batch)-> earliest layer node of each batch
-        layers_need_change = [np.inf] * batch
-        for bi, bd in enumerate(split["decision"]):
-            for node in bd:
-                if num_constr[node[0]][bi] == 0:
-                    num_constr[node[0]][bi] = 1
-                    num_constr[node[0]][bi + batch] = 1
-                if node[0] < layers_need_change[bi]:
-                    layers_need_change[bi] = node[0]
-
-        # print("@@num_constr", num_constr)
-        # initial results with empty list
-        ret_l = [[] for _ in range(batch * 2)]
-        ret_u = [[] for _ in range(batch * 2)]
-        ret_s = [[] for _ in range(batch * 2)]
-        betas = [[] for _ in range(batch * 2)]  # Not actually used, since beta values are stored in the history.
-        best_intermediate_betas = [defaultdict(dict) for _ in range(batch * 2)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
-
-        if debug:
-            if split_history[0]:
-                for shi, sh in enumerate(split_history):
-                    print(
-                        f"##################################split_history batch {shi}##################################")
-                    print("beta", sh["beta"])
-                    print("c", sh["c"])
-                    print("coeffs", sh["coeffs"])
-                    print("bias", sh["bias"])
-                    print("single_beta", sh["single_beta"])
-            print("history", history)
-
-        # new_split_history: store beta, c, coeffs tensors in this branch such that children can use
-        # list (total_batch*2)->list (relu layers)->the beta/c/coeffs tensors for each layer (None if not used)
-        new_split_history = [{"beta": [None for _ in range(len(self.net.relus))],
-                              "c": [None for _ in range(len(self.net.relus))],
-                              "coeffs": [None for _ in range(len(self.net.relus))],
-                              "bias": [None for _ in range(len(self.net.relus))],
-                              "single_beta": [None for _ in range(len(self.net.relus))]}
-                             for _ in range(batch * 2)]
-
-        start_prepare_time = time.time()
-        # collect all the variables that need to be optimized here
-        self.net.beta_params = []
-        self.net.single_beta_params = []
-        self.net.single_beta_mask = []
-        if opt_coeffs:
-            self.net.coeffs_params = []
-            self.net.split_dense_coeffs_params = []
-        if opt_bias: self.net.bias_params = []
-
-        # reset the beta information of each layer
-        for m in self.net.relus:
-            # split ones are the new split constraint from split["deicsion"]: needs to optimize split_beta, split_coeffs, split_bias
-            m.split_beta = [None for _ in range(2 * batch)]
-            m.split_c = [0 for _ in range(2 * batch)]
-            # split coeffs support either dense matrix or nonzero index paired with value
-            m.split_coeffs = {"dense": None, "nonzero": [], "coeffs": []}
-            m.split_bias = [None for _ in range(2 * batch)]
-
-            # hisotry constraints: Only optimize history beta. All the others are copies from split_history
-            m.history_beta = [None for _ in range(2 * batch)]
-            m.history_c = [None for _ in range(2 * batch)]
-            m.history_coeffs = [None for _ in range(2 * batch)]
-            m.history_bias = [None for _ in range(2 * batch)]
-
-            # masked_beta (batch, m.flattened_nodes) is the eventual coeffs mm (beta*c)
-            m.masked_beta = None
-            # m.split_beta_used: True if any of this layer node is used in the new split constraints
-            m.split_beta_used = False
-            # m.history_beta_used: True if any of this layer node is used in the history constraints
-            m.history_beta_used = False
-
-            # if any of the current/history split constraints are single node constraint, 
-            # we save and optimize beta in m.beta and c in m.beta_mask
-            m.single_beta_used = False
-            m.beta = torch.zeros(2*batch, m.flattened_nodes, device=device)
-            m.beta_mask = torch.zeros(2*batch, m.flattened_nodes, device=device)
-            # The non-zero element position for single node split.
-            m._single_beta_loc = [[] for _ in range(2*batch)]
-            # The coefficients for non-zero element position for single node split.
-            m._single_beta_sign = [[] for _ in range(2*batch)]
-
-        ######################################### Collect the split and history constraints ########################################
-        for lbi in range(batch):
-            if len(split["decision"][lbi])==1:
-                # this is a single node split for batch lbi, only assign beta and beta_mask
-                node = split["decision"][lbi][0]
-                m = self.net.relus[node[0]]
-                m.beta_mask[lbi, node[1]] = 1
-                m.beta_mask[lbi+batch, node[1]] = -1
-                # Also save the location and split sign for later use.
-                m._single_beta_loc[lbi].append(node[1])
-                m._single_beta_loc[lbi+batch].append(node[1])
-                m._single_beta_sign[lbi].append(1.0)
-                m._single_beta_sign[lbi+batch].append(-1.0)
-                m.single_beta_used = True
-                # print(f'example {lbi} split {m.name} {m._single_beta_loc[lbi]}')
-            else:
-                # lbi is the index of small batch for assigning beta/c/coeffs for current split constraint
-                for di in range(len(split["decision"][lbi])):
-                    # index di iterates the nodes in the new split constraint of each batch
-                    # tmp_d[lbi] map lbi idx to the total large batch
-                    node = split["decision"][lbi][di]
-                    coeff = split["coeffs"][lbi][di]
-                    m = self.net.relus[node[0]]
-                    m.split_beta_used = True
-                    # need to assign coeffs value to sparse_coeffs twicie
-                    m.split_coeffs["nonzero"].append([lbi, node[1]])
-                    m.split_coeffs["coeffs"].append(coeff)
-                    # m.split_c 1 means this constraint>0, 0 means not used in this layer, -1 means<0
-                    m.split_c[lbi] = 1
-                    m.split_c[lbi + batch] = -1
-
-            if split_history[0]:
-                # now we handle history constraints for each batch lbi
-                # only the first split will have [[]] split history and not go into this if branch
-                for lidx, m in enumerate(self.net.relus):
-                    # lidx is the index of relu layers since history constraints could involve any layer nodes
-                    beta_idx = split_history[lbi]["beta"][lidx]
-                    c_idx = split_history[lbi]["c"][lidx]
-                    coeffs_idx = split_history[lbi]["coeffs"][lidx]
-                    single_beta_idx = split_history[lbi]["single_beta"][lidx]
-
-                    if single_beta_idx is not None:
-                        m.single_beta_used = True
-                        nonzero_index = single_beta_idx["nonzero"]
-                        m.beta_mask[lbi][nonzero_index] = m.beta_mask[lbi][nonzero_index] + single_beta_idx["c"]
-                        m.beta_mask[lbi+batch][nonzero_index] = m.beta_mask[lbi+batch][nonzero_index] + single_beta_idx["c"]
-                        m.beta[lbi][nonzero_index] = m.beta[lbi][nonzero_index] + single_beta_idx["value"]
-                        m.beta[lbi+batch][nonzero_index] = m.beta[lbi+batch][nonzero_index] + single_beta_idx["value"]
-                        # Also save the location and split sign for later use.
-                        # Always put the current split to the last.
-                        # print(f'example {lbi} history {m.name} {m._single_beta_loc[lbi]} {nonzero_index.squeeze(1).cpu().numpy().tolist()}')
-                        m._single_beta_loc[lbi] = nonzero_index.squeeze(1).cpu().numpy().tolist() + m._single_beta_loc[lbi]
-                        m._single_beta_loc[lbi+batch] = nonzero_index.squeeze(1).cpu().numpy().tolist() + m._single_beta_loc[lbi+batch]
-                        m._single_beta_sign[lbi] = single_beta_idx["c"].squeeze(1).cpu().numpy().tolist() + m._single_beta_sign[lbi]
-                        m._single_beta_sign[lbi+batch] = single_beta_idx["c"].squeeze(1).cpu().numpy().tolist() + m._single_beta_sign[lbi+batch]
-
-                    if beta_idx is not None:
-                        # it means batch lbi layer lidx has history general splits
-                        m.history_beta_used = True
-
-                        if beta_warmup:
-                            m.history_beta[lbi] = beta_idx.detach().clone()
-                            m.history_beta[lbi + batch] = beta_idx.detach().clone()
-                        else:
-                            m.history_beta[lbi] = beta_idx.detach().clone().zero_()
-                            m.history_beta[lbi + batch] = beta_idx.detach().clone().zero_()
-
-                        m.history_c[lbi] = c_idx.detach().clone()
-                        m.history_c[lbi + batch] = c_idx.detach().clone()
-                        m.history_c[lbi].requires_grad = False
-                        m.history_c[lbi + batch].requires_grad = False
-
-                        m.history_coeffs[lbi] = {"nonzero": coeffs_idx["nonzero"],
-                                                 "coeffs": coeffs_idx["coeffs"].detach().clone()}
-                        m.history_coeffs[lbi + batch] = {"nonzero": coeffs_idx["nonzero"],
-                                                         "coeffs": coeffs_idx["coeffs"].detach().clone()}
-                        m.history_coeffs[lbi]["coeffs"].requires_grad = False
-                        m.history_coeffs[lbi + batch]["coeffs"].requires_grad = False
-
-                        if opt_bias:
-                            bias_idx = split_history[lbi]["bias"][lidx]
-                            m.history_bias[lbi] = bias_idx.detach().clone()
-                            m.history_bias[lbi + batch] = bias_idx.detach().clone()
-                            m.history_bias[lbi].requires_grad = False
-                            m.history_bias[lbi + batch].requires_grad = False
-
-        ######################################### Process split and history constraints to be sparse matrix ########################################
-        # m.split_c (2*batch, 1): 1 means this constraint>0, 0 means not used in this layer, -1 means<0; optimization: False
-        # m.split_beta (2*batch, 1): init to be 0, beta for each constraint; optimization: True
-        # m.split_bias (2*batch, 1): init to be 0; optimization: True
-        # m.split_coeffs["dense"] (batch, m.flattened_nodes): the dense matrix for the new constraint; optimzation: True
-        # m.split_coeffs["nonzero"] (# nonzero nodes, 2) ([batch index, node index]): the first batch index, using to assign value to sparse matrix m.new_split_coeffs; optimization: False
-        # m.split_coeffs["coeffs"] (# nonzero nodes): the coeffs value; optimization: opt_coeffs
-        # m.new_split_coeffs (2*batch, self.flattened_nodes): the sparse matrix of coeffs
-        # m.bias (batch, 1): constraint + bias</>=0, reuse for the first and rest half batch; optimization: opt_bias
-        # m.history_c (2*batch->[# constraints in each batch]): history c in each batch
-        # m.history_beta (2*batch->[# constraints in each batch]): history beta in each batch
-        # m.new_history_c (2*batch, max_nbeta): sparse matrix for c for all batches; optimization: False
-        # m.new_history_beta (2*batch, max_nbeta): sparse matrix for beta for all batches optimization: True
-        # m.history_coeffs["nonzero"] (2*batch->(# nonzero nodes, 2)) ([constraint index, node index]): the nonzero coeffs index in each batch
-        # m.history_coeffs["coeffs"] (2*batch->(# nonzero nodes)): the coeffs value in each batch
-        # m.new_history_coeffs (2*batch, m.flattened_node, max_nbeta): sparse matrix for coeffs; optimization: False
-        # m.history_bias (2*batch->[# constraints in each batch]): history bias in each batch
-        # m.new_history_bias (2*batch, max_nbeta): sparse matrix for bias for all batches; optimization: False
-
-        for lidx, m in enumerate(self.net.relus):
-            if m.single_beta_used:
-                m.beta = m.beta.detach().requires_grad_(True)
-                self.net.single_beta_params.append(m.beta)
-                self.net.single_beta_mask.append(m.beta_mask)
-                # Convert single_beta_loc and single_beta_sign to tensors.
-                m.max_single_split = max([len(a) for a in m._single_beta_loc]) 
-                m.single_beta_loc = torch.zeros(size=(2 * batch, m.max_single_split), dtype=torch.int64, device=device, requires_grad=False)
-                m.single_beta_sign = torch.zeros(size=(2 * batch, m.max_single_split), dtype=torch.get_default_dtype(), device=device, requires_grad=True)
-                for split_index, (beta_loc, beta_sign) in enumerate(zip(m._single_beta_loc, m._single_beta_sign)):
-                    m.single_beta_loc[split_index].data[:len(beta_loc)] = torch.tensor(beta_loc, dtype=torch.int64, device=device)
-                    m.single_beta_sign[split_index].data[:len(beta_sign)] = torch.tensor(beta_sign, dtype=torch.get_default_dtype(), device=device)  # Unassigned is 0.
-                if m.max_single_split == 0:
-                    m.single_beta_used = False
-
-            if m.split_beta_used:
-                ####### sparse coeffs and new_beta for split constraints #######
-                m.split_c = torch.tensor(m.split_c, dtype=torch.get_default_dtype(), device=device,
-                                         requires_grad=False).unsqueeze(-1)
-                if m.split_c.abs().sum() > 0:
-                    # there are nodes used the new split constraint in this layer
-                    m.split_beta = torch.zeros(m.split_c.shape, dtype=torch.get_default_dtype(), device=device)
-                    m.split_beta.requires_grad = True
-                    self.net.beta_params.append(m.split_beta)
-
-                    m.split_coeffs["nonzero"] = torch.tensor(m.split_coeffs["nonzero"], dtype=torch.long,
-                                                             device=device, requires_grad=False)
-                    m.split_coeffs["coeffs"] = torch.tensor(m.split_coeffs["coeffs"], dtype=torch.get_default_dtype(),
-                                                            device=device)
-                    # construct the dense matrix for the split coeffs
-                    m.split_coeffs["dense"] = torch.zeros((batch, m.flattened_nodes), dtype=torch.get_default_dtype(),
-                                                          device=device)
-                    m.split_coeffs["dense"][(m.split_coeffs["nonzero"][:, 0], m.split_coeffs["nonzero"][:, 1])] = \
-                    m.split_coeffs["coeffs"]
-                    m.split_coeffs["dense"] = m.split_coeffs["dense"].detach()
-                    dense_mask = torch.zeros((batch, m.flattened_nodes), dtype=torch.bool, device=device,
-                                             requires_grad=False)
-                    dense_mask[(m.split_coeffs["nonzero"][:, 0], m.split_coeffs["nonzero"][:, 1])] = True
-
-                    if opt_coeffs:
-                        # m.split_coeffs["coeffs"].requires_grad=True
-                        # self.net.coeffs_params.append(m.split_coeffs["coeffs"])
-                        m.split_coeffs["dense"].requires_grad = True
-                        self.net.split_dense_coeffs_params.append(
-                            {"dense": m.split_coeffs["dense"], "mask": dense_mask})
-                    # coeffs_nonzero = (m.split_coeffs["nonzero"][:,0], m.split_coeffs["nonzero"][:,1])
-
-                    if opt_bias:
-                        m.split_bias = torch.zeros((batch, 1), dtype=torch.get_default_dtype(), device=device)
-                        m.split_bias.requires_grad = True
-                        self.net.bias_params.append(m.split_bias)
-
-            if m.history_beta_used:
-                ####### sparse_coeffs and new_beta for history constraints #######
-                # Rebuild data-structure
-                m.max_nbeta = 0  # max number of beta constraints in this batch (since each example in this batch can have different number of betas).
-                num_elements = 0  # total number of coefficients in this batch.
-                for batch_i in range(len(m.history_beta)):
-                    if m.history_beta[batch_i] is not None:
-                        m.max_nbeta = max(m.max_nbeta, m.history_beta[batch_i].size(1))
-                        num_elements += m.history_coeffs[batch_i]["coeffs"].size(0)
-                if m.max_nbeta == 0:
-                    m.new_history_beta, m.new_history_coeffs = None, None
-                    continue
-
-                # We want create a coeffient tensor in size (batch, self.flattened_nodes, m.max_nbeta).
-                # Since we know exactly how many elements are there in this sparse matrix, we pre-allocate entire indices arrays,
-                # avoiding creating a lot of small (1,1) tensors and avoiding using the low-efficient torch.cat().
-                # Do not hardcode device; our code needs to run on CPUs as well.
-                batch_indices = torch.empty(size=(num_elements,), dtype=torch.long, device=device,
-                                            requires_grad=False)
-                node_indices = torch.empty(size=(num_elements,), dtype=torch.long, device=device,
-                                           requires_grad=False)
-                beta_indices = torch.empty(size=(num_elements,), dtype=torch.long, device=device,
-                                           requires_grad=False)
-                # In fact, we do not need gradient for history coefficients. We only need gradients for the last set of coefficients, which can be handled separatedly.
-                # The sparse bmm() function does not support gradient to the sparse array, so we cannot obtain their gradients.
-                values = torch.empty(size=(num_elements,), device=device, requires_grad=False)
-                # Create a new beta tensor, with size (batch, m.max_nbeta).
-                m.new_history_beta = torch.zeros(size=(len(m.history_beta), m.max_nbeta), device=device)
-                m.new_history_c = torch.zeros(size=(len(m.history_c), m.max_nbeta), device=device)
-                if opt_bias: m.new_history_bias = torch.zeros(size=(len(m.history_c), m.max_nbeta), device=device)
-                index = 0
-                for batch_i in range(len(m.history_beta)):
-                    if m.history_beta[batch_i] is None:
-                        continue
-                    coeffs_indices = m.history_coeffs[batch_i][
-                        "nonzero"]  # If you need torch.cat in the final code, make sure it is in update_bounds_parallel(), not here!
-                    n_coeffs = coeffs_indices.size(0)  # number of coefficents for this batch element.
-                    # which beta is this? e.g., first beta, second beta, etc.
-                    beta_indices[index:index + n_coeffs] = coeffs_indices[:, 0].detach()
-                    # insert the relu node indices for this split constraint.
-                    node_indices[index:index + n_coeffs] = coeffs_indices[:, 1].detach()
-                    # Set the batch indices to the batch ID.
-                    batch_indices[index:index + n_coeffs] = batch_i
-                    # The values of coefficients over all beta of this element.
-                    values[index:index + n_coeffs] = m.history_coeffs[batch_i]["coeffs"]
-                    # Move to the next elements.
-                    index += n_coeffs
-                    m.new_history_beta[batch_i][:m.history_beta[batch_i].size(1)] = m.history_beta[batch_i].squeeze(
-                        0)
-                    m.new_history_c[batch_i][:m.history_c[batch_i].size(1)] = m.history_c[batch_i].squeeze(0)
-                    if opt_bias: m.new_history_bias[batch_i][:m.history_bias[batch_i].size(1)] = m.history_bias[
-                        batch_i].squeeze(0)
-                # we need the gradients for all the betas
-                m.new_history_beta = m.new_history_beta.detach()
-                m.new_history_beta.requires_grad = True
-                self.net.beta_params.append(m.new_history_beta)
-                # We don't need gradient for these coefficients.
-                m.new_history_coeffs = torch.sparse_coo_tensor(
-                    torch.stack([batch_indices, node_indices, beta_indices]), values,
-                    (len(m.history_beta), m.flattened_nodes, m.max_nbeta), requires_grad=False, device=device)
-                m.new_history_coeffs = m.new_history_coeffs.coalesce().to_dense()
-
-        if debug:
-            for mi, m in enumerate(self.net.relus):
-                print(f"##################################layer{mi}##################################")
-                print("split_beta", m.split_beta)
-                print("split_c", m.split_c)
-                print("split_coeffs", m.split_coeffs)
-                print("split_bias", m.split_bias)
-                print("history_beta", m.history_beta)
-                print("history_c", m.history_c)
-                print("history_coeffs", m.history_coeffs)
-                print("history_bias", m.history_bias)
-                print("single_beta", m.beta)
-                print("single_beta_mask", m.beta_mask)
-
-        ######################################### Process done, compute bounds! ########################################
-        # idx is the index of relu layers, change_idx is the index of all layers
-
-        with torch.no_grad():
-            upper_bounds = [i.clone() for i in pre_ub_all[:-1]]
-            lower_bounds = [i.clone() for i in pre_lb_all[:-1]]
-
-            upper_bounds_cp = copy.deepcopy(upper_bounds)
-            lower_bounds_cp = copy.deepcopy(lower_bounds)
-
-            for i in range(len(lower_bounds)):
-                if not lower_bounds[i].is_contiguous():
-                    upper_bounds[i] = upper_bounds[i].contiguous()
-                    lower_bounds[i] = lower_bounds[i].contiguous()
-
-            for i in range(batch):
-                if len(split["decision"][i]) == 1 and not opt_bias:
-                    d, idx = split["decision"][i][0][0], split["decision"][i][0][1]
-                    upper_bounds[d].view(batch, -1)[i][idx] = 0.0
-                    lower_bounds[d].view(batch, -1)[i][idx] = 0.0
-
-            pre_lb_all = [torch.cat(2 * [i]) for i in pre_lb_all]
-            pre_ub_all = [torch.cat(2 * [i]) for i in pre_ub_all]
-
-            # merge the inactive and active splits together
-            new_candidate = {}
-            for i, (l, uc, lc, u) in enumerate(zip(lower_bounds, upper_bounds_cp, lower_bounds_cp, upper_bounds)):
-                # we set lower = 0 in first half batch, and upper = 0 in second half batch
-                new_candidate[self.name_dict[i]] = [torch.cat((l, lc), dim=0), torch.cat((uc, u), dim=0)]
-
-        # if not layer_set_bound:
-        #     new_candidate_p = {}
-        #     for i, (l, u) in enumerate(zip(pre_lb_all[:-1], pre_ub_all[:-1])):
-        #         # we set lower = 0 in first half batch, and upper = 0 in second half batch
-        #         new_candidate_p[self.name_dict[i]] = [l, u]
-
-        # create new_x here since batch may change
-        ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
-                                 x_L=self.x.ptb.x_L.repeat(batch * 2, 1, 1, 1),
-                                 x_U=self.x.ptb.x_U.repeat(batch * 2, 1, 1, 1))
-        new_x = BoundedTensor(self.x.data.repeat(batch * 2, 1, 1, 1), ptb)
-        self.net(new_x)  # batch may change, so we need to do forward to set some shapes here
-        c = None if self.c is None else self.c.repeat(new_x.shape[0], 1, 1)
-
-        if len(slopes) > 0:
-            # set slope here again
-            print(f'calling with {intermediate_refinement_layers}')
-            self.set_slope(self.net, slopes, intermediate_refinement_layers=intermediate_refinement_layers)
-
-        """
-        for ii, example in enumerate(intermediate_betas):
-            if example is not None:
-                for kk in example.keys():
-                    for kkk in example[kk].keys():
-                        print(f'example intermediate_betas {ii} {kk} {kkk}')
-            else:
-                print(f'skipe example intermediate_betas {ii}')
-        """
-
-        if opt_intermediate_beta and intermediate_betas is not None:
-            # selected_intermediate_betas = [intermediate_betas[i] for i in tmp_d]
-            # Set it as the initial. Dupllicate for the second half of the batch.
-            if len(intermediate_refinement_layers) == 0:
-                del intermediate_betas  # Free GPU memory.
-                self.net.init_intermediate_betas = None
-            else:
-                self.net.init_intermediate_betas = intermediate_betas + intermediate_betas
-
-        prepare_time += time.time() - start_prepare_time
-        start_bound_time = time.time()
-
-        if layer_set_bound and not opt_intermediate_beta:
-            start_beta_bound_time = time.time()
-            self.net.set_bound_opts({'optimize_bound_args':
-                                         {'ob_beta': beta, 'ob_single_node_split': False,
-                                          'ob_opt_coeffs': opt_coeffs, 'ob_opt_bias': opt_bias,
-                                          'ob_update_by_layer': layer_set_bound, 'ob_iteration': iteration,
-                                          'ob_lr': lr_alpha, 'ob_lr_beta': lr_beta, 'ob_lr_intermediate_beta': lr_intermediate_beta,
-                                          'ob_optimizer': optimizer}})
-            lb, ub, = self.net.compute_bounds(x=(new_x,), IBP=False, C=c, method='CROWN-Optimized',
-                                              new_interval=new_candidate, return_A=False, bound_upper=False)
-            beta_bound_time += time.time() - start_beta_bound_time
-
-        else:
-            # all intermediate bounds are re-calculated by optimized CROWN
-            self.net.set_bound_opts(
-                {'optimize_bound_args': {'ob_beta': beta, 'ob_update_by_layer': layer_set_bound,
-                                         'ob_iteration': iteration, 'ob_lr': lr_alpha, 'ob_lr_beta': lr_beta,
-                                         'ob_lr_intermediate_beta': lr_intermediate_beta,
-                                         'ob_opt_coeffs': opt_coeffs, 'ob_opt_bias': opt_bias,
-                                         'ob_single_node_split': False, 'ob_intermediate_beta': opt_intermediate_beta,
-                                         'ob_intermediate_refinement_layers': intermediate_refinement_layers,
-                                         'ob_optimizer': optimizer}})
-            lb, ub, = self.net.compute_bounds(x=(new_x,), IBP=False, C=c, method='CROWN-Optimized',
-                                              new_interval=new_candidate, return_A=False, bound_upper=False)
-
-        bound_time += time.time() - start_bound_time
-
-        # print('best results of parent nodes', pre_lb_all[-1].repeat(2, 1))
-        # print('finally, after optimization:', lower_bounds_new[-1])
-
-        # Move tensors to CPU for all elements in this batch.
-        with torch.no_grad():
-            # Move tensors to CPU for all elements in this batch.
-            start_transfer_time = time.time()
-            lb = lb.to(device='cpu')
-            transfer_net = self.transfer_to_cpu(self.net, non_blocking=False, opt_intermediate_beta=opt_intermediate_beta)
-            transfer_time = time.time() - start_transfer_time
-
-            start_finalize_time = time.time()
-            lower_bounds_new, upper_bounds_new = self.get_candidate_parallel(transfer_net, lb, lb + 99, batch * 2)
-            lower_bounds_new[-1] = torch.max(lower_bounds_new[-1], pre_lb_all[-1].cpu())
-            upper_bounds_new[-1] = torch.min(upper_bounds_new[-1], pre_ub_all[-1].cpu())
-
-
-
-
-            lAs = self.get_lA_parallel(transfer_net)
-
-            if len(slopes) > 0:
-                ret_s = self.get_slope(transfer_net)
-
-            # reshape the results
-            for i in range(batch):
-                ret_l[i] = [j[i:i + 1] for j in lower_bounds_new]
-                ret_l[i + batch] = [j[i + batch:i + batch + 1] for j in lower_bounds_new]
-
-                ret_u[i] = [j[i:i + 1] for j in upper_bounds_new]
-                ret_u[i + batch] = [j[i + batch:i + batch + 1] for j in upper_bounds_new]
-
-                # Save the best intermediate betas of this batch.
-                if opt_intermediate_beta and self.net.best_intermediate_betas is not None:
-                    # In self.net.best_intermediate_betas, relu layer name is the key, corresponds to the split in that layer.
-                    # The value of the dict is 'split' or 'history' or 'single'
-                    # For each 'split' and 'history' and 'single', there is a dictionary contains intermediates beta for all intermediate layers.
-                    # And there are two sets of intermediate betas, one for lb and one for ub.
-                    # each value is lb and ub with [batch, *layer_shape, n_splits]
-                    # Example: self.net.best_intermediate_betas['/22']['split']['/9']['lb'].
-                    # Note that since each batch element can have different number of splits, some splits can be dummy splits. We must skip these splits
-                    # when saving best intermediate betas to the domain.
-                    for split_layer, all_int_betas_this_layer in transfer_net.best_intermediate_betas.items():
-                        if 'single' in all_int_betas_this_layer:
-                            assert 'history' not in all_int_betas_this_layer
-                            assert 'split' not in all_int_betas_this_layer
-                            # Has single node split. Choose the used number of betas.
-                            lidx = relu_node2idx[split_layer]
-                            this_layer_history = split_history[i]["single_beta"][lidx] if split_history[i] is not None else None
-                            # Can be None when there is no split in this layer.
-                            n_split_this_layer = len(this_layer_history["nonzero"]) if this_layer_history is not None else 0
-                            # The current split, if it is on the same layer.
-                            split_node = split["decision"][i][0]
-                            if split_node[0] == lidx:
-                                # The current split is always the last row.
-                                n_split_this_layer += 1
-                            if n_split_this_layer > 0:
-                                for intermediate_layer, this_layer_intermediate_betas in all_int_betas_this_layer['single'].items():
-                                    best_intermediate_betas[i][split_layer][intermediate_layer] = {
-                                        "lb": this_layer_intermediate_betas['lb'][i, ..., :n_split_this_layer],
-                                        "ub": this_layer_intermediate_betas['ub'][i, ..., :n_split_this_layer],
-                                    }
-                                    # The other side of the split.
-                                    best_intermediate_betas[i + batch][split_layer][
-                                        intermediate_layer] = {
-                                        "lb": this_layer_intermediate_betas['lb'][i + batch, ..., :n_split_this_layer],
-                                        "ub": this_layer_intermediate_betas['ub'][i + batch, ..., :n_split_this_layer],
-                                    }
-                                    # print(f'example {i} {i+batch} saved {split_layer} {intermediate_layer} with {n_split_this_layer} splits')
-                        if 'history' in all_int_betas_this_layer:
-                            # Has history split. Choose the used number of betas.
-                            lidx = relu_node2idx[split_layer]
-                            this_layer_history = split_history[i]["c"][lidx]
-                            # Can be None when there is no split in this layer.
-                            n_split_this_layer = len(this_layer_history) if this_layer_history is not None else 0
-                            if n_split_this_layer > 0:
-                                for intermediate_layer, this_layer_intermediate_betas in all_int_betas_this_layer['history'].items():
-                                    best_intermediate_betas[i][split_layer][intermediate_layer] = {
-                                        "lb": this_layer_intermediate_betas['lb'][i, ..., :n_split_this_layer],
-                                        "ub": this_layer_intermediate_betas['ub'][i, ..., :n_split_this_layer],
-                                    }
-                                    # The other side of the split.
-                                    best_intermediate_betas[i + batch][split_layer][
-                                        intermediate_layer] = {
-                                        "lb": this_layer_intermediate_betas['lb'][i + batch, ..., :n_split_this_layer],
-                                        "ub": this_layer_intermediate_betas['ub'][i + batch, ..., :n_split_this_layer],
-                                    }
-                        # The currentv split with 1 beta.
-                        if 'split' in all_int_betas_this_layer:
-                            for intermediate_layer, this_layer_intermediate_betas in all_int_betas_this_layer['split'].items():
-                                if intermediate_layer in best_intermediate_betas[i][split_layer]:
-                                    # Existing betas from history split need to be concatenated.
-                                    best_intermediate_betas[i][split_layer][intermediate_layer] = {
-                                        "lb": torch.cat((best_intermediate_betas[i][split_layer][
-                                                             intermediate_layer]["lb"],
-                                                         this_layer_intermediate_betas['lb'][i]), dim=-1),
-                                        "ub": torch.cat((best_intermediate_betas[i][split_layer][
-                                                             intermediate_layer]["ub"],
-                                                         this_layer_intermediate_betas['ub'][i]), dim=-1),
-                                    }
-                                    # The other side of the split.
-                                    best_intermediate_betas[i + batch][split_layer][
-                                        intermediate_layer] = {
-                                        "lb": torch.cat((
-                                                        best_intermediate_betas[i + batch][split_layer][
-                                                            intermediate_layer]["lb"],
-                                                        this_layer_intermediate_betas['lb'][i + batch]), dim=-1),
-                                        "ub": torch.cat((
-                                                        best_intermediate_betas[i + batch][split_layer][
-                                                            intermediate_layer]["ub"],
-                                                        this_layer_intermediate_betas['ub'][i + batch]), dim=-1),
-                                    }
-                                else:
-                                    best_intermediate_betas[i][split_layer][intermediate_layer] = {
-                                        "lb": this_layer_intermediate_betas['lb'][i],
-                                        "ub": this_layer_intermediate_betas['ub'][i],
-                                    }
-                                    # The other side of the split.
-                                    best_intermediate_betas[i + batch][split_layer][
-                                        intermediate_layer] = {
-                                        "lb": this_layer_intermediate_betas['lb'][i + batch],
-                                        "ub": this_layer_intermediate_betas['ub'][i + batch],
-                                    }
-
-        ######################################### save split and history constraints to new_split_history ########################################
-        with torch.no_grad():
-            for lbi in range(batch):
-                for lidx, m in enumerate(self.net.relus):
-
-                    if m.single_beta_used:
-                        # save the beta for single split constraints
-                        nonzero_index = torch.tensor(m._single_beta_loc[lbi], dtype=torch.int64).unsqueeze(1)
-                        new_split_history[lbi]["single_beta"][lidx] = {"nonzero": nonzero_index, "value":m.beta[lbi][nonzero_index], "c": m.beta_mask[lbi][nonzero_index]}
-                        new_split_history[lbi+batch]["single_beta"][lidx] = {"nonzero": nonzero_index, "value":m.beta[lbi+batch][nonzero_index], "c": m.beta_mask[lbi+batch][nonzero_index]}
-
-                    if m.history_beta[lbi] is not None and not m.split_beta_used:
-                        new_split_history[lbi]["beta"][lidx] = m.history_beta[lbi]
-                        new_split_history[lbi]["c"][lidx] = m.history_c[lbi]
-                        new_split_history[lbi]["coeffs"][lidx] = m.history_coeffs[lbi]
-
-                        new_split_history[lbi + batch]["beta"][lidx] = m.history_beta[lbi + batch]
-                        new_split_history[lbi + batch]["c"][lidx] = m.history_c[lbi + batch]
-                        new_split_history[lbi + batch]["coeffs"][lidx] = m.history_coeffs[lbi + batch]
-
-                        if opt_bias:
-                            new_split_history[lbi]["bias"][lidx] = m.history_bias[lbi]
-                            new_split_history[lbi + batch]["bias"][lidx] = m.history_bias[lbi + batch]
-
-                    elif m.split_beta_used and m.history_beta[lbi] is None:
-                        new_split_history[lbi]["beta"][lidx] = m.split_beta[lbi].unsqueeze(0)
-                        new_split_history[lbi]["c"][lidx] = m.split_c[lbi].unsqueeze(0)
-
-                        batch_nonzero_index = (m.split_coeffs["nonzero"][:, 0] == lbi)
-                        split_coeffs_nonzero = m.split_coeffs["nonzero"][batch_nonzero_index].detach().clone()
-                        if m.split_coeffs["dense"] is None:
-                            split_coeffs_value = m.split_coeffs["coeffs"][batch_nonzero_index].detach().clone()
-                        else:
-                            split_coeffs_value = m.split_coeffs["dense"][
-                                (split_coeffs_nonzero[:, 0], split_coeffs_nonzero[:, 1])].detach().clone()
-                        split_coeffs_nonzero[:, 0] = 0
-                        split_coeffs_value.requires_grad = False
-                        new_split_history[lbi]["coeffs"][lidx] = {"nonzero": split_coeffs_nonzero,
-                                                                         "coeffs": split_coeffs_value}
-
-                        new_split_history[lbi + batch]["beta"][lidx] = m.split_beta[lbi + batch].unsqueeze(0)
-                        new_split_history[lbi + batch]["c"][lidx] = m.split_c[lbi + batch].unsqueeze(0)
-                        new_split_history[lbi + batch]["coeffs"][lidx] = {"nonzero": split_coeffs_nonzero,
-                                                                                       "coeffs": split_coeffs_value}
-
-                        if opt_bias:
-                            split_bias = m.split_bias[lbi].detach().clone()
-                            split_bias.requires_grad = False
-                            new_split_history[lbi]["bias"][lidx] = split_bias.unsqueeze(0)
-                            new_split_history[lbi + batch]["bias"][lidx] = split_bias.unsqueeze(0)
-
-                    elif m.split_beta_used and m.history_beta[lbi] is not None:
-                        batch_nonzero_index = (m.split_coeffs["nonzero"][:, 0] == lbi)
-                        split_coeffs_nonzero = m.split_coeffs["nonzero"][batch_nonzero_index].detach().clone()
-                        if m.split_coeffs["dense"] is None:
-                            split_coeffs_value = m.split_coeffs["coeffs"][batch_nonzero_index].detach().clone()
-                        else:
-                            split_coeffs_value = m.split_coeffs["dense"][
-                                (split_coeffs_nonzero[:, 0], split_coeffs_nonzero[:, 1])].detach().clone()
-                        split_coeffs_value.requires_grad = False
-                        # insert the current split constraint before the history split constraints
-                        split_coeffs_nonzero[:, 0] = 0
-                        history_coeffs_nonzero, history_coeffs_value = m.history_coeffs[lbi][
-                                                                           "nonzero"].detach().clone(), \
-                                                                       m.history_coeffs[lbi]["coeffs"].detach().clone()
-                        # move the current history constraints after the enw split constraint
-                        history_coeffs_nonzero[:, 0] = history_coeffs_nonzero[:, 0] + 1
-
-                        new_split_history[lbi]["beta"][lidx] = torch.cat(
-                            (m.split_beta[lbi].unsqueeze(0), m.history_beta[lbi]), 1).detach()
-                        new_split_history[lbi]["c"][lidx] = torch.cat(
-                            (m.split_c[lbi].unsqueeze(0), m.history_c[lbi]), 1).detach()
-                        new_split_history[lbi]["coeffs"][lidx] = {
-                            "nonzero": torch.cat((split_coeffs_nonzero, history_coeffs_nonzero), 0).detach(),
-                            "coeffs": torch.cat((split_coeffs_value, history_coeffs_value), 0).detach()}
-
-                        new_split_history[lbi + batch]["beta"][lidx] = torch.cat(
-                            (m.split_beta[lbi + batch].unsqueeze(0), m.history_beta[lbi + batch]), 1).detach()
-                        new_split_history[lbi + batch]["c"][lidx] = torch.cat(
-                            (m.split_c[lbi + batch].unsqueeze(0), m.history_c[lbi + batch]), 1).detach()
-                        new_split_history[lbi + batch]["coeffs"][lidx] = {
-                            "nonzero": torch.cat((split_coeffs_nonzero, history_coeffs_nonzero), 0).detach(),
-                            "coeffs": torch.cat((split_coeffs_value, history_coeffs_value), 0).detach()}
-
-                        if opt_bias:
-                            split_bias = m.split_bias[lbi].detach().clone()
-                            split_bias.requires_grad = False
-                            new_split_history[lbi]["bias"][lidx] = torch.cat(
-                                (split_bias.unsqueeze(0), m.history_bias[lbi]), 1).detach()
-                            new_split_history[lbi + batch]["bias"][lidx] = torch.cat(
-                                (split_bias.unsqueeze(0), m.history_bias[lbi + batch]), 1).detach()
-
-        if debug:
-            for shi, sh in enumerate(new_split_history):
-                print(
-                    f"##################################new_split_history batch {shi}##################################")
-                print("beta", sh["beta"])
-                print("c", sh["c"])
-                print("coeffs", sh["coeffs"])
-                print("bias", sh["bias"])
-                print("single_beta", sh["single_beta"])
-
-        finalize_time = time.time() - start_finalize_time
-        func_time = time.time() - func_time
-        total_func_time += func_time
-        total_bound_time += bound_time
-        total_beta_bound_time += beta_bound_time
-        total_prepare_time += prepare_time
-        total_transfer_time += transfer_time
-        total_finalize_time += finalize_time
-        print(f'This batch time : update_bounds func: {func_time:.4f}\t prepare: {prepare_time:.4f}\t bound: {bound_time:.4f}\t transfer: {transfer_time:.4f}\t finalize: {finalize_time:.4f}')
-        print(f'Accumulated time: update_bounds func: {total_func_time:.4f}\t prepare: {total_prepare_time:.4f}\t bound: {total_bound_time:.4f}\t transfer: {transfer_time:.4f}\t finalize: {total_finalize_time:.4f}')
-        return ret_l, ret_u, lAs, ret_s, betas, new_split_history, best_intermediate_betas, None
-
 
     def get_neuron_primal(self, input_primal, lb, ub, slope_opt=None):
         # calculate the primal values for intermediate neurons

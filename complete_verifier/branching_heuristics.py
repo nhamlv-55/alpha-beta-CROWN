@@ -12,7 +12,6 @@
 ##                                                                     ##
 #########################################################################
 from typing_extensions import final
-from beta_CROWN_solver import FIXED_SPLIT
 
 from numpy.lib.twodim_base import mask_indices
 import torch
@@ -537,32 +536,19 @@ def choose_node_parallel_kFSB(lower_bounds, upper_bounds, orig_mask, net, pre_re
     final_decision = []
 
     # real batch = batch * 2, since we have two kinds of scores.
-    if FIXED_SPLIT:
-        lbs = [i for i in lower_bounds]
-        ups = [i for i in upper_bounds]
-        if isinstance(slopes[0], dict):
-            # per neuron slope.
-            sps = slopes 
-        else:
-            sps = [i for i in slopes]
-        if use_beta:
-            bs = [i for i in betas]
 
-        print(lbs, "\n",  sps)
-        # raise Exception
+    lbs = [torch.cat([i, i]) for i in lower_bounds]
+    ups = [torch.cat([i, i]) for i in upper_bounds]
+    if isinstance(slopes[0], dict):
+        # per neuron slope.
+        sps = slopes + slopes
     else:
-        lbs = [torch.cat([i, i]) for i in lower_bounds]
-        ups = [torch.cat([i, i]) for i in upper_bounds]
-        if isinstance(slopes[0], dict):
-            # per neuron slope.
-            sps = slopes + slopes
-        else:
-            sps = [torch.cat([i, i]) for i in slopes]
-        if use_beta:
-            bs = [torch.cat([i, i]) for i in betas]
-            history += history
-        print(lbs, "\n" , sps)
-        # raise Exception
+        sps = [torch.cat([i, i]) for i in slopes]
+    if use_beta:
+        bs = [torch.cat([i, i]) for i in betas]
+        history += history
+    print(lbs, "\n" , sps)
+    # raise Exception
 
     # Use score_length to convert an index to its layer and offset.
     score_length = np.cumsum([len(score[i][0]) for i in range(len(score))])
@@ -580,11 +566,8 @@ def choose_node_parallel_kFSB(lower_bounds, upper_bounds, orig_mask, net, pre_re
 
     k_decision = []
 
-    if FIXED_SPLIT:
-        k_ret = torch.empty(size=(topk, batch),
-                        device=lower_bounds[0].device, requires_grad=False)
-    else:
-        k_ret = torch.empty(size=(topk, batch * 2),
+
+    k_ret = torch.empty(size=(topk, batch * 2),
                             device=lower_bounds[0].device, requires_grad=False)
     set_slope = True  # We only set the slope once.
     for k in range(topk):

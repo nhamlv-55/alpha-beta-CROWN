@@ -15,6 +15,7 @@ import bisect
 import copy
 from collections import defaultdict
 import logging
+from auto_LiRPA.operators.activation import FIXED_SPLIT
 import torch
 import numpy as np
 from sortedcontainers import SortedList
@@ -302,7 +303,9 @@ def add_domain_parallel(lA, lb, ub, lb_all, up_all, domains, selected_domains, s
                 domains.add(left)
 
         infeasible = False
-        if lb[i+batch] < decision_thresh:
+
+
+        if not FIXED_SPLIT and lb[i+batch] < decision_thresh:
             # if growth_rate and (selected_domains[i].lower_bound - lb[i+batch]) > selected_domains[i].lower_bound * growth_rate and flag:
             #     selected_domains[i].split = True
             #     bisect.insort_left(domains, selected_domains[i])
