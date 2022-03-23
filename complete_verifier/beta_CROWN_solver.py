@@ -31,7 +31,7 @@ total_func_time = total_prepare_time = total_bound_time = total_beta_bound_time 
 
 class LiRPAConvNet:
     def __init__(self, model_ori, pred, test, device='cuda', simplify=False, in_size=(1, 3, 32, 32),
-                 conv_mode='patches', deterministic=False, c=None):
+                 conv_mode='patches', deterministic=False, c=None, fixed_relu_mask = None):
         """
         convert pytorch model to auto_LiRPA module
         """
@@ -50,6 +50,10 @@ class LiRPAConvNet:
         self.pool_result = None
         self.pool_termination_flag = None
 
+        """
+        Nham: this is for fixing relu splits
+        """
+        self.fixed_relu_mask = fixed_relu_mask
     
     def get_lower_bound(self, pre_lbs, pre_ubs, split, slopes=None, betas=None, history=None, layer_set_bound=True, 
                         split_history=None, single_node_split=True, intermediate_betas=None):
@@ -460,23 +464,6 @@ class LiRPAConvNet:
         print("beta", beta)
         # initial results with empty list
 
-        if FIXED_SPLIT and beta:
-            ret_l = [[] for _ in range(batch + diving_batch)]
-            ret_u = [[] for _ in range(batch + diving_batch)]
-            ret_s = [[] for _ in range(batch + diving_batch)]
-            ret_b = [[] for _ in range(batch + diving_batch)]
-            new_split_history = [{} for _ in range(batch + diving_batch)]
-            best_intermediate_betas = [defaultdict(dict) for _ in range(batch + diving_batch)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
-
-
-        else:
-
-            ret_l = [[] for _ in range(batch * 2 + diving_batch)]
-            ret_u = [[] for _ in range(batch * 2 + diving_batch)]
-            ret_s = [[] for _ in range(batch * 2 + diving_batch)]
-            ret_b = [[] for _ in range(batch * 2 + diving_batch)]
-            new_split_history = [{} for _ in range(batch * 2 + diving_batch)]
-            best_intermediate_betas = [defaultdict(dict) for _ in range(batch * 2 + diving_batch)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
 
         start_prepare_time = time.time()
         # iteratively change upper and lower bound from former to later layer
@@ -542,6 +529,13 @@ class LiRPAConvNet:
                     d = decision[bi][0]  # layer of this split.
                     split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
                     self.net.relus[d].sparse_beta_sign[bi, split_len] = SIGN
+                ret_l = [[] for _ in range(batch + diving_batch)]
+                ret_u = [[] for _ in range(batch + diving_batch)]
+                ret_s = [[] for _ in range(batch + diving_batch)]
+                ret_b = [[] for _ in range(batch + diving_batch)]
+                new_split_history = [{} for _ in range(batch + diving_batch)]
+                best_intermediate_betas = [defaultdict(dict) for _ in range(batch + diving_batch)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
+
             else:
                 # Duplicate split location.
                 for m in self.net.relus:
@@ -553,6 +547,12 @@ class LiRPAConvNet:
                     d = decision[bi][0]  # layer of this split.
                     split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
                     self.net.relus[d].sparse_beta_sign[bi + batch, split_len] = -1.0
+                ret_l = [[] for _ in range(batch * 2 + diving_batch)]
+                ret_u = [[] for _ in range(batch * 2 + diving_batch)]
+                ret_s = [[] for _ in range(batch * 2 + diving_batch)]
+                ret_b = [[] for _ in range(batch * 2 + diving_batch)]
+                new_split_history = [{} for _ in range(batch * 2 + diving_batch)]
+                best_intermediate_betas = [defaultdict(dict) for _ in range(batch * 2 + diving_batch)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
             # Transfer tensors to GPU.
             for m in self.net.relus:
                 print(m)
