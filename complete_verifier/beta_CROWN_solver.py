@@ -603,7 +603,7 @@ class LiRPAConvNet:
                 # 2 * batch + diving_batch
                 upper_bounds = [i[:batch] for i in pre_ub_all[:-1]]
                 lower_bounds = [i[:batch] for i in pre_lb_all[:-1]]
-                print("in update_bounds_parallel", lower_bounds)
+                logger.debug("in update_bounds_parallel{}".format(lower_bounds))
                 # Only the last element is used later.
                 pre_lb_last = torch.cat([pre_lb_all[-1][:batch], pre_lb_all[-1][batch:]])
                 pre_ub_last = torch.cat([pre_ub_all[-1][:batch], pre_ub_all[-1][batch:]])
@@ -616,10 +616,6 @@ class LiRPAConvNet:
                     # for each layer except the last output layer
                     if len(zero_indices_batch[d]):
                         # we set lower = 0 in first half batch, and upper = 0 in second half batch
-                        print("lbd", lower_bounds[d])
-                        print("lbd", lower_bounds[d][:batch])
-                        print("lbd", lower_bounds[d][:batch].view(batch, -1))
-
                         #Nham: If we do not split RELU here, only lower_bound or upper_bound should be updated
                         if SIGN:
                             #Nham: Fix the ReLU to be positive, so only need to change lower bound to be 0
@@ -643,12 +639,10 @@ class LiRPAConvNet:
                 zero_indices_neuron = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_neuron]
 
                 # 2 * batch + diving_batch
-                print("in update bound parallel pre_ub_all ", pre_ub_all[:-1])
-                print("batch", batch)
-                print("************************")
                 upper_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_ub_all[:-1]]
                 lower_bounds = [torch.cat([i[:batch], i[:batch], i[batch:]], dim=0) for i in pre_lb_all[:-1]]
 
+                logger.debug("in update_bounds_parallel{}".format(lower_bounds))
                 # Only the last element is used later.
                 pre_lb_last = torch.cat([pre_lb_all[-1][:batch], pre_lb_all[-1][:batch], pre_lb_all[-1][batch:]])
                 pre_ub_last = torch.cat([pre_ub_all[-1][:batch], pre_ub_all[-1][:batch], pre_ub_all[-1][batch:]])
@@ -672,7 +666,6 @@ class LiRPAConvNet:
                                     x_U=self.x.ptb.x_U.repeat(batch + diving_batch, 1, 1, 1))
             new_x = BoundedTensor(self.x.data.repeat(batch + diving_batch, 1, 1, 1), ptb)
             c = None if self.c is None else self.c.repeat(new_x.shape[0], 1, 1)
-            print("c")
         else:
             ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
                                     x_L=self.x.ptb.x_L.repeat(batch * 2 + diving_batch, 1, 1, 1),

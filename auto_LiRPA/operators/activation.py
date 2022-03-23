@@ -540,8 +540,8 @@ class BoundRelu(BoundOptimizableActivation):
                         uA = self.non_deter_scatter_add(uA.view(uA.size(0), uA.size(1), -1), dim=2, index=beta_indices, src=beta_values)
                         uA = uA.view(prev_size)
                     if lA is not None:
-                        print("beta_indices", beta_indices)
-                        print("lA shape", lA.shape)
+                        logger.debug("beta_indices:{}".format( beta_indices))
+                        logger.debug("lA shape:{}".format( lA.shape))
                         lA = self.non_deter_scatter_add(lA.view(lA.size(0), lA.size(1), -1), dim=2, index=beta_indices, src=beta_values.neg())
                         lA = lA.view(prev_size)
                 else:
