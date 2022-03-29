@@ -23,7 +23,6 @@ from auto_LiRPA import BoundedModule, BoundedTensor
 from auto_LiRPA.bound_ops import BoundRelu
 from auto_LiRPA.perturbations import *
 from auto_LiRPA.utils import reduction_sum, stop_criterion_sum, stop_criterion_min
-from auto_LiRPA.operators.activation import FIXED_SPLIT, SIGN
 from lp_mip_solver import *
 
 total_func_time = total_prepare_time = total_bound_time = total_beta_bound_time = total_transfer_time = total_finalize_time = 0.0
@@ -87,7 +86,7 @@ class LiRPAConvNet:
                                             intermediate_betas=intermediate_betas, layer_set_bound=layer_set_bound)
 
         # if get_upper_bound and single_node_split, primals have p and z values; otherwise None
-        lower_bounds, upper_bounds, lAs, slopes, betas, split_history, best_intermediate_betas, primals = ret
+        lower_bounds, upper_bounds, lAs, slopes, betas, split_history, best_intermediate_betas, primals, should_fix_relu = ret
 
         beta_crown_lbs = [i[-1].item() for i in lower_bounds]
         beta_time = time.time()-start
@@ -121,7 +120,7 @@ class LiRPAConvNet:
         print("Lower bound of this batch:")
         print(lower_bounds)
         return [i[-1].item() for i in upper_bounds], [i[-1].item() for i in lower_bounds], None, lAs, lower_bounds, \
-               upper_bounds, slopes, split_history, betas, best_intermediate_betas, primals
+               upper_bounds, slopes, split_history, betas, best_intermediate_betas, primals, should_fix_relu
 
 
     def get_relu(self, model, idx):
@@ -278,14 +277,10 @@ class LiRPAConvNet:
         return ret_lA
 
 
-    def get_beta(self, model, splits_per_example, diving_batch=0):
+    def get_beta(self, model, splits_per_example, diving_batch=0, should_fix_relu = False):
         # split_per_example only has half of the examples.
-
-
-
         batch = splits_per_example.size(0) - diving_batch
-        print(">>>>>>batch", batch)
-        if FIXED_SPLIT:
+        if should_fix_relu:
             retb = [[] for i in range(batch + diving_batch)]
             for mi, m in enumerate(model.relus):
                 for i in range(batch):
@@ -323,7 +318,7 @@ class LiRPAConvNet:
         return ret
 
 
-    def set_slope(self, model, slope, intermediate_refinement_layers=None, diving_batch=0, should_duplicate = True):
+    def set_slope(self, model, slope, intermediate_refinement_layers=None, diving_batch=0, should_fix_relu = False):
         cleanup_intermediate_slope = isinstance(intermediate_refinement_layers, list) and len(intermediate_refinement_layers) == 0
         if cleanup_intermediate_slope:
             # Clean all intermediate betas if we are not going to refine intermeidate layer neurons anymore.
@@ -354,7 +349,7 @@ class LiRPAConvNet:
                                 m.alpha[spec_name] = torch.cat([slope[i][m.name][spec_name] for i in range(len(slope) - diving_batch)], dim=2)
                                 # Duplicate for the second half of the batch.
                                 """Nham: looks like A is duplicate here"""
-                                if should_duplicate:
+                                if not should_fix_relu:
                                     m.alpha[spec_name] = m.alpha[spec_name].repeat(1, 1, 2, *([1] * (m.alpha[spec_name].ndim - 3))).detach().requires_grad_()
                             if diving_batch > 0:
                                 # create diving alpha
@@ -393,7 +388,7 @@ class LiRPAConvNet:
             raise NotImplementedError
 
 
-    def reset_beta(self, model, batch, max_splits_per_layer=None, betas=None, diving_batch=0):
+    def reset_beta(self, model, batch, max_splits_per_layer=None, betas=None, diving_batch=0, should_fix_relu = False):
         # Recreate new beta with appropriate shape.
         for mi, m in enumerate(self.net.relus):
             # Create only the non-zero beta. For each layer, it is padded to maximal length.
@@ -409,7 +404,7 @@ class LiRPAConvNet:
                     valid_betas = len(betas[bi][mi])
                     m.sparse_beta[bi, :valid_betas] = betas[bi][mi]
             # This is the beta variable to be optimized for this layer.
-            if FIXED_SPLIT:
+            if should_fix_relu:
                 m.sparse_beta = m.sparse_beta.detach().to(device=self.net.device, non_blocking=True).requires_grad_()
             else:
                 m.sparse_beta = m.sparse_beta.repeat(2, 1).detach().to(device=self.net.device, non_blocking=True).requires_grad_()
@@ -435,6 +430,8 @@ class LiRPAConvNet:
     def update_bounds_parallel(self, pre_lb_all=None, pre_ub_all=None, split=None, slopes=None, beta=None, betas=None,
                         early_stop=True, history=None, layer_set_bound=True, shortcut=False):
         global total_func_time, total_bound_time, total_prepare_time, total_beta_bound_time, total_transfer_time, total_finalize_time
+
+
 
         if beta is None:
             beta = arguments.Config["solver"]["beta-crown"]["beta"] # might need to set beta False in FSB node selection
@@ -462,13 +459,36 @@ class LiRPAConvNet:
         print("batch", batch)
         print("decision", decision)
         print("beta", beta)
-        # initial results with empty list
 
 
+        #setup and compute whether a relu should be fixed or not
+        should_fix_relu = False
+        br_layer = decision[0][0]
+        br_index = decision[0][1]
+
+        if beta and br_index in self.fixed_relu_mask[br_layer][0]:
+            """
+            Nham: is kFSB is used, it is expected that only one node is branched at a time
+            So all the entry in the decision should actually be the same
+            """
+            def _batch_is_the_same(decision):
+                actual_decision = tuple(decision[0])
+                for d in decision:
+                    if tuple(d)!=actual_decision:
+                        return False
+                return True
+
+            assert(_batch_is_the_same(decision))
+            sign = self.fixed_relu_mask[br_layer][1][self.fixed_relu_mask[br_layer][0].index(br_index)]
+            print("The ReLU {} is in the fixed relu mask with sign {}".format(decision[0], sign))
+            should_fix_relu = True
+
+        
         start_prepare_time = time.time()
         # iteratively change upper and lower bound from former to later layer
 
         if beta:
+
             # count how many split nodes in each batch example (batch, num of layers)
             splits_per_example = torch.zeros(size=(batch, len(self.net.relus)), dtype=torch.int64, device='cpu', requires_grad=False)
             for bi in range(batch):
@@ -492,7 +512,7 @@ class LiRPAConvNet:
                 del diving_splits_per_example
 
             # Create and load warmup beta.
-            self.reset_beta(self.net, batch, betas=betas, max_splits_per_layer=max_splits_per_layer, diving_batch=diving_batch)  # warm start beta
+            self.reset_beta(self.net, batch, betas=betas, max_splits_per_layer=max_splits_per_layer, diving_batch=diving_batch, should_fix_relu=should_fix_relu)  # warm start beta
 
             for bi in range(batch):
                 # Add history splits.
@@ -516,7 +536,7 @@ class LiRPAConvNet:
 
             
             """
-            if FIXED_SPLIT:
+            if should_fix_relu:
                 """
                 Nham: is a stable node, no duplication
                 """
@@ -528,7 +548,7 @@ class LiRPAConvNet:
                 for bi in range(batch):
                     d = decision[bi][0]  # layer of this split.
                     split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
-                    self.net.relus[d].sparse_beta_sign[bi, split_len] = SIGN
+                    self.net.relus[d].sparse_beta_sign[bi, split_len] = sign
                 ret_l = [[] for _ in range(batch + diving_batch)]
                 ret_u = [[] for _ in range(batch + diving_batch)]
                 ret_s = [[] for _ in range(batch + diving_batch)]
@@ -582,7 +602,7 @@ class LiRPAConvNet:
                 m.beta = None
 
         # pre_ub_all[:-1] means pre-set bounds for all intermediate layers
-        if FIXED_SPLIT and beta:
+        if should_fix_relu:
             with torch.no_grad():
                 print("pre_lb_all", pre_lb_all)
 
@@ -617,13 +637,20 @@ class LiRPAConvNet:
                     if len(zero_indices_batch[d]):
                         # we set lower = 0 in first half batch, and upper = 0 in second half batch
                         #Nham: If we do not split RELU here, only lower_bound or upper_bound should be updated
-                        if SIGN:
+                        if sign==-1:
                             #Nham: Fix the ReLU to be positive, so only need to change lower bound to be 0
                             lower_bounds[d][:batch].view(batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
                         else:
                             #Nham: Fix the ReLU to be negative, so only need to update upper bound to be 0
                             upper_bounds[d][:batch].view(batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
                     new_candidate[self.name_dict[d]] = [lower_bounds[d], upper_bounds[d]]
+
+            # create new_x here since batch may change
+            ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
+                                    x_L=self.x.ptb.x_L.repeat(batch + diving_batch, 1, 1, 1),
+                                    x_U=self.x.ptb.x_U.repeat(batch + diving_batch, 1, 1, 1))
+            new_x = BoundedTensor(self.x.data.repeat(batch + diving_batch, 1, 1, 1), ptb)
+            c = None if self.c is None else self.c.repeat(new_x.shape[0], 1, 1)
 
         else:            
             with torch.no_grad():
@@ -658,30 +685,17 @@ class LiRPAConvNet:
                         lower_bounds[d][:2 * batch].view(2 * batch, -1)[zero_indices_batch[d], zero_indices_neuron[d]] = 0.0
                         upper_bounds[d][:2 * batch].view(2 * batch, -1)[zero_indices_batch[d] + batch, zero_indices_neuron[d]] = 0.0
                     new_candidate[self.name_dict[d]] = [lower_bounds[d], upper_bounds[d]]
-                # breakpoint()
-        # create new_x here since batch may change
-        if FIXED_SPLIT and beta:
-            ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
-                                    x_L=self.x.ptb.x_L.repeat(batch + diving_batch, 1, 1, 1),
-                                    x_U=self.x.ptb.x_U.repeat(batch + diving_batch, 1, 1, 1))
-            new_x = BoundedTensor(self.x.data.repeat(batch + diving_batch, 1, 1, 1), ptb)
-            c = None if self.c is None else self.c.repeat(new_x.shape[0], 1, 1)
-        else:
+        
+            # create new_x here since batch may change
             ptb = PerturbationLpNorm(norm=self.x.ptb.norm, eps=self.x.ptb.eps,
                                     x_L=self.x.ptb.x_L.repeat(batch * 2 + diving_batch, 1, 1, 1),
                                     x_U=self.x.ptb.x_U.repeat(batch * 2 + diving_batch, 1, 1, 1))
             new_x = BoundedTensor(self.x.data.repeat(batch * 2 + diving_batch, 1, 1, 1), ptb)
             c = None if self.c is None else self.c.repeat(new_x.shape[0], 1, 1)
 
-        # self.net(new_x)  # batch may change, so we need to do forward to set some shapes here
-
         if len(slopes) > 0:
-            if FIXED_SPLIT and beta:
-                should_duplicate = False
-            else:
-                should_duplicate = True
             # set slope here again
-            self.set_slope(self.net, slopes, diving_batch=diving_batch, should_duplicate=should_duplicate)
+            self.set_slope(self.net, slopes, diving_batch=diving_batch, should_fix_relu = should_fix_relu)
 
         prepare_time += time.time() - start_prepare_time
         start_bound_time = time.time()
@@ -743,10 +757,10 @@ class LiRPAConvNet:
                 ret_s = self.get_slope(transfer_net)
 
             if beta:
-                ret_b = self.get_beta(transfer_net, splits_per_example, diving_batch=diving_batch)
+                ret_b = self.get_beta(transfer_net, splits_per_example, diving_batch=diving_batch, should_fix_relu=should_fix_relu)
 
             # Reorganize tensors.
-            if FIXED_SPLIT and beta:
+            if should_fix_relu:
                 lower_bounds_new, upper_bounds_new = self.get_candidate_parallel(transfer_net, lb, ub, batch, diving_batch=diving_batch)
             else:
                 lower_bounds_new, upper_bounds_new = self.get_candidate_parallel(transfer_net, lb, ub, batch * 2, diving_batch=diving_batch)
@@ -758,7 +772,7 @@ class LiRPAConvNet:
                 upper_bounds_new[-1] = torch.min(upper_bounds_new[-1], pre_ub_last.cpu())
             # reshape the results based on batch.
 
-            if FIXED_SPLIT:
+            if should_fix_relu:
                 for i in range(batch):
                     ret_l[i] = [j[i:i + 1] for j in lower_bounds_new]
                     ret_u[i] = [j[i:i + 1] for j in upper_bounds_new]
@@ -803,7 +817,9 @@ class LiRPAConvNet:
         # if primals is not None: ret_p = self.layer_wise_primals(primals)
 
         # assert (ret_p[1]['p'][0][0] == primal_x[1]).all()
-        return ret_l, ret_u, lAs, ret_s, ret_b, new_split_history, best_intermediate_betas, primal_x
+        return ret_l, ret_u, lAs, \
+                 ret_s, ret_b, \
+                new_split_history, best_intermediate_betas, primal_x, should_fix_relu
 
     def get_neuron_primal(self, input_primal, lb, ub, slope_opt=None):
         # calculate the primal values for intermediate neurons

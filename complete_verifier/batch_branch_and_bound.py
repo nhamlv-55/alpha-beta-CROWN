@@ -29,7 +29,8 @@ all_node_split = False
 DFS_enabled = False
 
 
-def batch_verification(d, net, batch, pre_relu_indices, growth_rate, layer_set_bound=True, adv_pool=None):
+def batch_verification(d, net, batch, pre_relu_indices, growth_rate, 
+                        layer_set_bound=True, adv_pool=None):
     global Visited, Flag_first_split
     global Use_optimized_split
     global DFS_enabled
@@ -109,8 +110,9 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate, layer_set_b
         single_node_split = True
         ret = net.get_lower_bound(orig_lbs, orig_ubs, split, slopes=slopes, history=history,
                                 split_history=split_history, layer_set_bound=layer_set_bound, betas=betas,
-                                single_node_split=single_node_split, intermediate_betas=intermediate_betas)
-        dom_ub, dom_lb, dom_ub_point, lAs, dom_lb_all, dom_ub_all, slopes, split_history, betas, intermediate_betas, primals = ret
+                                single_node_split=single_node_split, intermediate_betas=intermediate_betas,
+                                )
+        dom_ub, dom_lb, dom_ub_point, lAs, dom_lb_all, dom_ub_all, slopes, split_history, betas, intermediate_betas, primals, should_fix_relu = ret
 
 
 
@@ -124,6 +126,7 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate, layer_set_b
         # If intermediate layers are not refined or updated, we do not need to check infeasibility when adding new domains.
         check_infeasibility = not (single_node_split and layer_set_bound)
         unsat_list = add_domain_parallel(lA=lAs[:2*batch], lb=dom_lb[:2*batch], ub=dom_ub[:2*batch], lb_all=dom_lb_all[:2*batch], up_all=dom_ub_all[:2*batch],
+                                        should_fix_relu=should_fix_relu,
                                          domains=d, selected_domains=selected_domains[:batch], slope=slopes[:2*batch], beta=betas[:2*batch],
                                          growth_rate=growth_rate, branching_decision=branching_decision, decision_thresh=decision_thresh,
                                          split_history=split_history[:2*batch], intermediate_betas=intermediate_betas[:2*batch],
