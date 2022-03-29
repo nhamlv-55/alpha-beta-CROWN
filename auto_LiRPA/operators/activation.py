@@ -1,9 +1,5 @@
 """ Activation operators or other unary nonlinear operators"""
 from .base import *
-# FIXED_SPLIT = False
-FIXED_SPLIT = True
-
-SIGN = 1
 
 
 class BoundActivation(Bound):
