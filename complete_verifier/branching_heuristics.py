@@ -547,7 +547,7 @@ def choose_node_parallel_kFSB(lower_bounds, upper_bounds, orig_mask, net, pre_re
     if use_beta:
         bs = [torch.cat([i, i]) for i in betas]
         history += history
-    print(lbs, "\n" , sps)
+    # print(lbs, "\n" , sps)
     # raise Exception
 
     # Use score_length to convert an index to its layer and offset.

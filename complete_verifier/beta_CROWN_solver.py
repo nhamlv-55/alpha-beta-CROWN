@@ -54,7 +54,7 @@ class LiRPAConvNet:
         """
         self.fixed_relu_mask = fixed_relu_mask
     
-    def get_lower_bound(self, pre_lbs, pre_ubs, split, slopes=None, betas=None, history=None, layer_set_bound=True, 
+    def get_lower_bound(self, pre_lbs, pre_ubs, split, should_fix_relu, slopes=None, betas=None, history=None, layer_set_bound=True, 
                         split_history=None, single_node_split=True, intermediate_betas=None):
 
         """
@@ -79,14 +79,14 @@ class LiRPAConvNet:
         if single_node_split:
             print("Using single node split")
             ret = self.update_bounds_parallel(pre_lbs, pre_ubs, split, slopes, betas=betas, early_stop=False, history=history,
-                                              layer_set_bound=layer_set_bound)
+                                              layer_set_bound=layer_set_bound, should_fix_relu = should_fix_relu)
         else:
             ret = self.update_bounds_parallel_general(pre_lbs, pre_ubs, split, slopes, early_stop=False,
                                             history=history, split_history=split_history, 
                                             intermediate_betas=intermediate_betas, layer_set_bound=layer_set_bound)
 
         # if get_upper_bound and single_node_split, primals have p and z values; otherwise None
-        lower_bounds, upper_bounds, lAs, slopes, betas, split_history, best_intermediate_betas, primals, should_fix_relu = ret
+        lower_bounds, upper_bounds, lAs, slopes, betas, split_history, best_intermediate_betas, primals = ret
 
         beta_crown_lbs = [i[-1].item() for i in lower_bounds]
         beta_time = time.time()-start
@@ -117,10 +117,10 @@ class LiRPAConvNet:
 
         end = time.time()
         print('batch bounding time: ', end - start)
-        print("Lower bound of this batch:")
-        print(lower_bounds)
+        # print("Lower bound of this batch:")
+        # print(lower_bounds)
         return [i[-1].item() for i in upper_bounds], [i[-1].item() for i in lower_bounds], None, lAs, lower_bounds, \
-               upper_bounds, slopes, split_history, betas, best_intermediate_betas, primals, should_fix_relu
+               upper_bounds, slopes, split_history, betas, best_intermediate_betas, primals
 
 
     def get_relu(self, model, idx):
@@ -215,7 +215,6 @@ class LiRPAConvNet:
         lower_bounds.append(lb.view(1, -1).detach())
         upper_bounds.append(ub.view(1, -1).detach())
 
-        print(self.name_dict)
         return lower_bounds, upper_bounds, self.pre_relu_indices
 
 
@@ -225,8 +224,8 @@ class LiRPAConvNet:
         upper_bounds = []
 
         for layer in model.relus:
-            print("In get_candidate_parallel")
-            print("layer.inputs", layer.inputs)
+            # print("In get_candidate_parallel")
+            # print("layer.inputs", layer.inputs)
             lower_bounds.append(layer.inputs[0].lower)
             upper_bounds.append(layer.inputs[0].upper)
 
@@ -234,7 +233,7 @@ class LiRPAConvNet:
         lower_bounds.append(lb.view(batch + diving_batch, -1).detach())
         upper_bounds.append(ub.view(batch + diving_batch, -1).detach())
 
-        print("lower_bounds:\n", lower_bounds)
+        # print("lower_bounds:\n", lower_bounds)
 
 
         return lower_bounds, upper_bounds
@@ -408,8 +407,7 @@ class LiRPAConvNet:
                 m.sparse_beta = m.sparse_beta.detach().to(device=self.net.device, non_blocking=True).requires_grad_()
             else:
                 m.sparse_beta = m.sparse_beta.repeat(2, 1).detach().to(device=self.net.device, non_blocking=True).requires_grad_()
-            
-            assert batch + diving_batch == len(betas)
+
             if diving_batch != 0:
                 m.diving_sparse_beta = torch.zeros(size=(diving_batch, max_splits_per_layer[mi]), dtype=torch.get_default_dtype(), device='cpu', requires_grad=False)
                 m.diving_sparse_beta_loc = torch.zeros(size=(diving_batch, max_splits_per_layer[mi]), dtype=torch.int64, device='cpu', requires_grad=False)
@@ -428,7 +426,7 @@ class LiRPAConvNet:
 
     """Main function for computing bounds after branch and bound in Beta-CROWN."""
     def update_bounds_parallel(self, pre_lb_all=None, pre_ub_all=None, split=None, slopes=None, beta=None, betas=None,
-                        early_stop=True, history=None, layer_set_bound=True, shortcut=False):
+                        early_stop=True, history=None, layer_set_bound=True, shortcut=False, should_fix_relu = False):
         global total_func_time, total_bound_time, total_prepare_time, total_beta_bound_time, total_transfer_time, total_finalize_time
 
 
@@ -453,37 +451,14 @@ class LiRPAConvNet:
             decision = np.array(split)
         else:
             decision = np.array(split["decision"])
+            if should_fix_relu:
+                coeffs = np.array(split["coeffs"])
+                assert(len(decision) == len(coeffs))
             decision = np.array([i.squeeze() for i in decision])
 
         batch = len(decision)
         print("batch", batch)
-        print("decision", decision)
-        print("beta", beta)
 
-
-        #setup and compute whether a relu should be fixed or not
-        should_fix_relu = False
-        br_layer = decision[0][0]
-        br_index = decision[0][1]
-
-        if beta and br_index in self.fixed_relu_mask[br_layer][0]:
-            """
-            Nham: is kFSB is used, it is expected that only one node is branched at a time
-            So all the entry in the decision should actually be the same
-            """
-            def _batch_is_the_same(decision):
-                actual_decision = tuple(decision[0])
-                for d in decision:
-                    if tuple(d)!=actual_decision:
-                        return False
-                return True
-
-            assert(_batch_is_the_same(decision))
-            sign = self.fixed_relu_mask[br_layer][1][self.fixed_relu_mask[br_layer][0].index(br_index)]
-            print("The ReLU {} is in the fixed relu mask with sign {}".format(decision[0], sign))
-            should_fix_relu = True
-
-        
         start_prepare_time = time.time()
         # iteratively change upper and lower bound from former to later layer
 
@@ -548,7 +523,7 @@ class LiRPAConvNet:
                 for bi in range(batch):
                     d = decision[bi][0]  # layer of this split.
                     split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
-                    self.net.relus[d].sparse_beta_sign[bi, split_len] = sign
+                    self.net.relus[d].sparse_beta_sign[bi, split_len] = coeffs[bi][0]
                 ret_l = [[] for _ in range(batch + diving_batch)]
                 ret_u = [[] for _ in range(batch + diving_batch)]
                 ret_s = [[] for _ in range(batch + diving_batch)]
@@ -575,9 +550,9 @@ class LiRPAConvNet:
                 best_intermediate_betas = [defaultdict(dict) for _ in range(batch * 2 + diving_batch)] # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
             # Transfer tensors to GPU.
             for m in self.net.relus:
-                print(m)
-                print("S matrix location\n", m.sparse_beta_loc, m.sparse_beta_loc.shape)
-                print("S matrix\n", m.sparse_beta_sign, m.sparse_beta_sign.shape)
+                logger.debug(m)
+                logger.debug("S matrix location\n", m.sparse_beta_loc, m.sparse_beta_loc.shape)
+                logger.debug("S matrix\n", m.sparse_beta_sign, m.sparse_beta_sign.shape)
 
                 m.sparse_beta_sign = m.sparse_beta_sign.to(device=self.net.device, non_blocking=True)
 
@@ -604,7 +579,7 @@ class LiRPAConvNet:
         # pre_ub_all[:-1] means pre-set bounds for all intermediate layers
         if should_fix_relu:
             with torch.no_grad():
-                print("pre_lb_all", pre_lb_all)
+                logger.debug("pre_lb_all", pre_lb_all)
 
                 # Setting the neuron upper/lower bounds with a split to 0.
                 zero_indices_batch = [[] for _ in range(len(pre_lb_all) - 1)]
@@ -617,8 +592,8 @@ class LiRPAConvNet:
                 zero_indices_batch = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_batch]
                 zero_indices_neuron = [torch.as_tensor(t).to(device=self.net.device, non_blocking=True) for t in zero_indices_neuron]
 
-                print(zero_indices_batch)
-                print(zero_indices_neuron)
+                # print(zero_indices_batch)
+                # print(zero_indices_neuron)
 
                 # 2 * batch + diving_batch
                 upper_bounds = [i[:batch] for i in pre_ub_all[:-1]]
@@ -704,7 +679,7 @@ class LiRPAConvNet:
             self.net.set_bound_opts({'optimize_bound_args': {'ob_beta': beta, 'ob_single_node_split': True,
                 'ob_update_by_layer': layer_set_bound, 'ob_optimizer':optimizer}})
             with torch.no_grad():
-                print(new_x.shape)
+                logger.debug("new_x shape:", new_x.shape)
                 lb, _, = self.net.compute_bounds(x=(new_x,), IBP=False, C=c, method='backward',
                                                  new_interval=new_candidate, bound_upper=False, return_A=False)
             return lb
@@ -766,7 +741,7 @@ class LiRPAConvNet:
                 lower_bounds_new, upper_bounds_new = self.get_candidate_parallel(transfer_net, lb, ub, batch * 2, diving_batch=diving_batch)
 
             lower_bounds_new[-1] = torch.max(lower_bounds_new[-1], pre_lb_last.cpu())
-            print("lower_bounds_new shape:\n", [tmp.shape for tmp in lower_bounds_new])
+            logger.debug("lower_bounds_new shape:\n", [tmp.shape for tmp in lower_bounds_new])
             if not get_upper_bound:
                 # Do not set to min so the primal is always corresponding to the upper bound.
                 upper_bounds_new[-1] = torch.min(upper_bounds_new[-1], pre_ub_last.cpu())
@@ -819,7 +794,7 @@ class LiRPAConvNet:
         # assert (ret_p[1]['p'][0][0] == primal_x[1]).all()
         return ret_l, ret_u, lAs, \
                  ret_s, ret_b, \
-                new_split_history, best_intermediate_betas, primal_x, should_fix_relu
+                new_split_history, best_intermediate_betas, primal_x
 
     def get_neuron_primal(self, input_primal, lb, ub, slope_opt=None):
         # calculate the primal values for intermediate neurons
@@ -958,7 +933,6 @@ class LiRPAConvNet:
         # first get CROWN bounds
         # Reference bounds are intermediate layer bounds from initial CROWN bounds.
         lb, ub, aux_reference_bounds = self.net.init_slope((self.x,), share_slopes=share_slopes, c=self.c, bound_upper=False)
-        print('initial CROWNNNN bounds:', lb, ub)
         if stop_criterion_func(lb).all().item():
             # Fast path. Initial CROWN bound can verify the network.
             if not self.simplify:
@@ -982,7 +956,6 @@ class LiRPAConvNet:
         # self.layer_names.sort()
 
         # update bounds
-        print('initial alpha-CROWN bounds:', lb, ub)
         primals, duals, mini_inp = None, None, None
         # mini_inp, primals = self.get_primals(self.A_dict)
         lb, ub, pre_relu_indices = self.get_candidate(self.net, lb, lb + 99)  # primals are better upper bounds

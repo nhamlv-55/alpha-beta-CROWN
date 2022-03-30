@@ -259,6 +259,9 @@ def add_domain_parallel(lA, lb, ub, lb_all, up_all, domains, selected_domains, s
     1. add to a sorted list
     2. add to a binary tree
     # diving: we are adding diving domains if True
+
+    Nham: how exactly does this function work?
+
     """
     unsat_list = []
     batch = len(selected_domains)
@@ -405,7 +408,13 @@ def pick_out_batch(domains, threshold, batch, device='cuda', DFS_percent=0, divi
     Returns: Non prunable CandidateDomain with the lowest reference_value.
     """
     print("In Pick_out_batch, dfs_percent:{}".format(DFS_percent))
-    print("domains:{}".format(domains))
+    print("domains:")
+    if len(domains)< 10:
+        print(domains)
+    else:
+        print(domains[:5])
+        print("...")
+        print(domains[-5:])
 
     assert batch > 0
     if torch.cuda.is_available(): torch.cuda.synchronize()  # make sure GPU to CPU transfer is finished

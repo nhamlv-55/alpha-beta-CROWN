@@ -30,7 +30,7 @@ DFS_enabled = False
 
 
 def batch_verification(d, net, batch, pre_relu_indices, growth_rate, 
-                        layer_set_bound=True, adv_pool=None):
+                        layer_set_bound=True, adv_pool=None, is_fixing_iteration = False):
     global Visited, Flag_first_split
     global Use_optimized_split
     global DFS_enabled
@@ -51,19 +51,24 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate,
     domains_params = pick_out_batch(d, decision_thresh, batch=batch * (1 - dive_rate), device=net.x.device, DFS_percent=DFS_percent if DFS_enabled else 0)
     mask, lAs, orig_lbs, orig_ubs, slopes, betas, intermediate_betas, selected_domains = domains_params
 
-    print("lAs", lAs)
     pickout_time = time.time() - pickout_time
 
     if mask is not None:
-
-        print("Original mask", mask)
         decision_time = time.time()
 
         # print('history', selected_domains[0].history)
         history = [sd.history for sd in selected_domains]
         split_history = [sd.split_history for sd in selected_domains]
-
-        if branching_method == 'babsr':
+        should_fix_relu = False
+        if is_fixing_iteration:
+            branching_decision = []
+            coeffs = []
+            for l_idx, layer in enumerate(net.fixed_relu_mask):
+                for r_idx, relu in enumerate(layer[0]):
+                    branching_decision.append([l_idx, relu])
+                    coeffs.append([layer[1][r_idx]])
+            should_fix_relu = True
+        elif branching_method == 'babsr':
             branching_decision = choose_node_parallel_crown(orig_lbs, orig_ubs, mask, net, pre_relu_indices, lAs,
                                                             batch=batch, branching_reduceop=branching_reduceop)
         elif branching_method == 'fsb':
@@ -79,7 +84,7 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate,
 
         print("branching decision", branching_decision)
 
-        if len(branching_decision) < len(mask[0]):
+        if len(branching_decision) < len(mask[0]) and not is_fixing_iteration:
             print('all nodes are split!!')
             global all_node_split
             all_node_split = True
@@ -95,7 +100,10 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate,
             # split["decision"]: selected domains (next batch/2)->node list->node: [layer, idx]
             split["decision"] = [[bd] for bd in branching_decision]
             # split["split"]: selected domains (next batch/2)->node list->float coefficients
-            split["coeffs"] = [[1.] for i in range(len(branching_decision))]
+            if is_fixing_iteration:
+                split["coeffs"] = coeffs
+            else:
+                split["coeffs"] = [[1.] for i in range(len(branching_decision))]
         else:
             split = {}
             num_nodes = 3
@@ -108,11 +116,12 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate,
 
         solve_time = time.time()
         single_node_split = True
-        ret = net.get_lower_bound(orig_lbs, orig_ubs, split, slopes=slopes, history=history,
+        ret = net.get_lower_bound(orig_lbs, orig_ubs, split, should_fix_relu = should_fix_relu,
+                                slopes=slopes, history=history,
                                 split_history=split_history, layer_set_bound=layer_set_bound, betas=betas,
                                 single_node_split=single_node_split, intermediate_betas=intermediate_betas,
                                 )
-        dom_ub, dom_lb, dom_ub_point, lAs, dom_lb_all, dom_ub_all, slopes, split_history, betas, intermediate_betas, primals, should_fix_relu = ret
+        dom_ub, dom_lb, dom_ub_point, lAs, dom_lb_all, dom_ub_all, slopes, split_history, betas, intermediate_betas, primals = ret
 
 
 
@@ -235,14 +244,24 @@ def relu_bab_parallel(net, domain, x, use_neuron_set_strategy=False, refined_low
     glb_record = [[time.time()-start, global_lb]]
     stop_condition = len(domains) > 0
     # while len(domains) > 0:
+    relu_is_fixed = False
     while stop_condition:
         if len(domains) > 80000 and len(domains) % 10000 < batch * 2 and use_neuron_set_strategy:  # do two batch of neuron set bounds  per 10000 domains
             # neuron set  bounds cost more memory, we set a smaller batch here
             global_lb, batch_ub = batch_verification(domains, net, int(batch/2), pre_relu_indices, 0, layer_set_bound=False,
                                         adv_pool=adv_pool)
         else:
-            global_lb, batch_ub = batch_verification(domains, net, batch, pre_relu_indices, 0,
+            if len(domains) > 500 and not relu_is_fixed:
+                print("In this particular iteration, we will branch on all the fixed relu")
+                global_lb, batch_ub = batch_verification(domains, net, 74, pre_relu_indices, 0,
                                         layer_set_bound=not opt_intermediate_beta,
+                                        is_fixing_iteration=True,
+                                        adv_pool=adv_pool)
+                relu_is_fixed = True
+            else:
+                global_lb, batch_ub = batch_verification(domains, net, batch, pre_relu_indices, 0,
+                                        layer_set_bound=not opt_intermediate_beta,
+                                        is_fixing_iteration=False,
                                         adv_pool=adv_pool)
         print(f"Global ub: {global_ub}, batch ub: {batch_ub}")
         global_ub = min(global_ub, batch_ub)
