@@ -28,6 +28,8 @@ Use_optimized_split = False
 all_node_split = False
 DFS_enabled = False
 
+CRASH = "Not finished"
+SUCCESS = "Finished"
 
 def batch_verification(d, net, batch, pre_relu_indices, growth_rate, 
                         layer_set_bound=True, adv_pool=None, is_fixing_iteration = False):
@@ -60,13 +62,11 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate,
         history = [sd.history for sd in selected_domains]
         split_history = [sd.split_history for sd in selected_domains]
         should_fix_relu = False
+        sign = None
         if is_fixing_iteration:
-            branching_decision = []
-            coeffs = []
-            for l_idx, layer in enumerate(net.fixed_relu_mask):
-                for r_idx, relu in enumerate(layer[0]):
-                    branching_decision.append([l_idx, relu])
-                    coeffs.append([layer[1][r_idx]])
+            branching_decision = [net.fixed_relu_mask["decision"].pop()]*min(len(selected_domains), batch)
+            coeffs = net.fixed_relu_mask["coeffs"].pop()*min(len(selected_domains), batch)
+            sign = coeffs[0]
             should_fix_relu = True
         elif branching_method == 'babsr':
             branching_decision = choose_node_parallel_crown(orig_lbs, orig_ubs, mask, net, pre_relu_indices, lAs,
@@ -116,7 +116,8 @@ def batch_verification(d, net, batch, pre_relu_indices, growth_rate,
 
         solve_time = time.time()
         single_node_split = True
-        ret = net.get_lower_bound(orig_lbs, orig_ubs, split, should_fix_relu = should_fix_relu,
+        ret = net.get_lower_bound(orig_lbs, orig_ubs, split, 
+                                should_fix_relu = should_fix_relu, sign=sign,
                                 slopes=slopes, history=history,
                                 split_history=split_history, layer_set_bound=layer_set_bound, betas=betas,
                                 single_node_split=single_node_split, intermediate_betas=intermediate_betas,
@@ -251,13 +252,14 @@ def relu_bab_parallel(net, domain, x, use_neuron_set_strategy=False, refined_low
             global_lb, batch_ub = batch_verification(domains, net, int(batch/2), pre_relu_indices, 0, layer_set_bound=False,
                                         adv_pool=adv_pool)
         else:
-            if len(domains) > 500 and not relu_is_fixed:
+            if len(domains) > 32 and net.fixed_relu_mask is not None and not relu_is_fixed:
                 print("In this particular iteration, we will branch on all the fixed relu")
-                global_lb, batch_ub = batch_verification(domains, net, 74, pre_relu_indices, 0,
+                global_lb, batch_ub = batch_verification(domains, net, batch, pre_relu_indices, 0,
                                         layer_set_bound=not opt_intermediate_beta,
                                         is_fixing_iteration=True,
                                         adv_pool=adv_pool)
-                relu_is_fixed = True
+                if len(net.fixed_relu_mask["decision"])==0:
+                    relu_is_fixed = True
             else:
                 global_lb, batch_ub = batch_verification(domains, net, batch, pre_relu_indices, 0,
                                         layer_set_bound=not opt_intermediate_beta,
@@ -279,25 +281,29 @@ def relu_bab_parallel(net, domain, x, use_neuron_set_strategy=False, refined_low
 
         if len(domains) > max_domains:
             print("No enough memory for the domain list!!!!!!!!")
+            print(CRASH)
             del domains
-            return global_lb, global_ub, glb_record, Visited
+            return global_lb, global_ub, glb_record, Visited, -1
 
         if get_upper_bound:
             if global_ub < decision_thresh:
                 print("Attack success during bab!!!!!!!!")
+                print(CRASH)
                 # Terminate MIP if it has been started.
                 del domains
-                return global_lb, global_ub, glb_record, Visited
+                return global_lb, global_ub, glb_record, Visited, -1
 
         if time.time() - start > timeout:
             print('Time out!!!!!!!!')
+            print(CRASH)
             del domains
             # np.save('glb_record.npy', np.array(glb_record))
-            return global_lb, global_ub, glb_record, Visited
+            return global_lb, global_ub, glb_record, Visited, -1
 
         if record:
             glb_record.append([time.time() - start, global_lb])
         print(f'Cumulative time: {time.time() - start}\n')
 
     del domains
-    return global_lb, global_ub, glb_record, Visited
+    print(SUCCESS)
+    return global_lb, global_ub, glb_record, Visited, time.time() - start

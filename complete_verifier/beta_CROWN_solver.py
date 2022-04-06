@@ -55,7 +55,7 @@ class LiRPAConvNet:
         self.fixed_relu_mask = fixed_relu_mask
     
     def get_lower_bound(self, pre_lbs, pre_ubs, split, should_fix_relu, slopes=None, betas=None, history=None, layer_set_bound=True, 
-                        split_history=None, single_node_split=True, intermediate_betas=None):
+                        split_history=None, single_node_split=True, intermediate_betas=None, sign = None):
 
         """
         # (in) pre_lbs: layers list -> tensor(batch, layer shape)
@@ -79,7 +79,7 @@ class LiRPAConvNet:
         if single_node_split:
             print("Using single node split")
             ret = self.update_bounds_parallel(pre_lbs, pre_ubs, split, slopes, betas=betas, early_stop=False, history=history,
-                                              layer_set_bound=layer_set_bound, should_fix_relu = should_fix_relu)
+                                              layer_set_bound=layer_set_bound, should_fix_relu = should_fix_relu, sign = sign)
         else:
             ret = self.update_bounds_parallel_general(pre_lbs, pre_ubs, split, slopes, early_stop=False,
                                             history=history, split_history=split_history, 
@@ -426,11 +426,12 @@ class LiRPAConvNet:
 
     """Main function for computing bounds after branch and bound in Beta-CROWN."""
     def update_bounds_parallel(self, pre_lb_all=None, pre_ub_all=None, split=None, slopes=None, beta=None, betas=None,
-                        early_stop=True, history=None, layer_set_bound=True, shortcut=False, should_fix_relu = False):
+                        early_stop=True, history=None, layer_set_bound=True, shortcut=False, should_fix_relu = False, sign = None):
         global total_func_time, total_bound_time, total_prepare_time, total_beta_bound_time, total_transfer_time, total_finalize_time
 
 
-
+        if should_fix_relu:
+            assert(sign is not None)
         if beta is None:
             beta = arguments.Config["solver"]["beta-crown"]["beta"] # might need to set beta False in FSB node selection
         optimizer = arguments.Config["solver"]["beta-crown"]["optimizer"]
@@ -523,7 +524,7 @@ class LiRPAConvNet:
                 for bi in range(batch):
                     d = decision[bi][0]  # layer of this split.
                     split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
-                    self.net.relus[d].sparse_beta_sign[bi, split_len] = coeffs[bi][0]
+                    self.net.relus[d].sparse_beta_sign[bi, split_len] = sign
                 ret_l = [[] for _ in range(batch + diving_batch)]
                 ret_u = [[] for _ in range(batch + diving_batch)]
                 ret_s = [[] for _ in range(batch + diving_batch)]
