@@ -15,6 +15,7 @@ import copy
 import time
 import random
 from collections import defaultdict, OrderedDict
+from matplotlib.pyplot import hist
 
 import torch
 import arguments
@@ -366,14 +367,15 @@ class LiRPAConvNetPlus:
             raise NotImplementedError
 
 
-    def reset_beta(self, model, batch, max_splits_per_layer=None, betas=None, diving_batch=0):
+    def _reset_beta(self, n_fixed_relus, n_unstable_relus, max_splits_per_layer=None, betas=None, diving_batch=0):
+        batch = n_fixed_relus + n_unstable_relus
         # Recreate new beta with appropriate shape.
-        for mi, m in enumerate(self.net.relus):
+        for mi, m in enumerate(self.net.relus): #For each ReLu layer
             # Create only the non-zero beta. For each layer, it is padded to maximal length.
             # We create tensors on CPU first, and they will be transferred to GPU after initialized.
-            m.sparse_beta = torch.zeros(size=(batch, max_splits_per_layer[mi]), dtype=torch.get_default_dtype(), device='cpu', requires_grad=False)
-            m.sparse_beta_loc = torch.zeros(size=(batch, max_splits_per_layer[mi]), dtype=torch.int64, device='cpu', requires_grad=False)
-            m.sparse_beta_sign = torch.zeros(size=(batch, max_splits_per_layer[mi]), dtype=torch.get_default_dtype(), device='cpu', requires_grad=False)
+            m.sparse_beta = torch.zeros(size=(n_fixed_relus + 2*n_unstable_relus, max_splits_per_layer[mi]), dtype=torch.get_default_dtype(), device='cpu', requires_grad=False)
+            m.sparse_beta_loc = torch.zeros(size=(n_fixed_relus + 2*n_unstable_relus, max_splits_per_layer[mi]), dtype=torch.int64, device='cpu', requires_grad=False)
+            m.sparse_beta_sign = torch.zeros(size=(n_fixed_relus + 2*n_unstable_relus, max_splits_per_layer[mi]), dtype=torch.get_default_dtype(), device='cpu', requires_grad=False)
             # Load beta from history.
             # for bi in range(len(betas)):
             for bi in range(batch):
@@ -381,46 +383,83 @@ class LiRPAConvNetPlus:
                     # First dimension of betas is batch, second dimension is relu layer, third dimension is saved betas.
                     valid_betas = len(betas[bi][mi])
                     m.sparse_beta[bi, :valid_betas] = betas[bi][mi]
-            # This is the beta variable to be optimized for this layer.
-            m.sparse_beta = m.sparse_beta.repeat(2, 1).detach().to(device=self.net.device, non_blocking=True).requires_grad_()
+                    if bi >= n_fixed_relus: # if this is corresponding to an unstable relus, we need to duplicate beta
+                        m.sparse_beta[bi+n_unstable_relus, :valid_betas] = betas[bi][mi]
             
-            assert batch + diving_batch == len(betas)
-            if diving_batch != 0:
-                m.diving_sparse_beta = torch.zeros(size=(diving_batch, max_splits_per_layer[mi]), dtype=torch.get_default_dtype(), device='cpu', requires_grad=False)
-                m.diving_sparse_beta_loc = torch.zeros(size=(diving_batch, max_splits_per_layer[mi]), dtype=torch.int64, device='cpu', requires_grad=False)
-                m.diving_sparse_beta_sign = torch.zeros(size=(diving_batch, max_splits_per_layer[mi]), dtype=torch.get_default_dtype(), device='cpu', requires_grad=False)
-                # Load diving beta from history.
-                for dbi in range(diving_batch):
-                    if betas[batch + dbi] is not None:
-                        # First dimension of betas is batch, second dimension is relu layer, third dimension is saved betas.
-                        valid_betas = len(betas[batch + dbi][mi])
-                        m.diving_sparse_beta[dbi, :valid_betas] = betas[batch + dbi][mi]
-                m.diving_sparse_beta = m.diving_sparse_beta.to(device=self.net.device, non_blocking=True)
-                m.sparse_beta = torch.cat([m.sparse_beta, m.diving_sparse_beta], dim=0).detach().\
-                            to(device=self.net.device, non_blocking=True).requires_grad_()
-                del m.diving_sparse_beta
+            m.sparse_beta = m.sparse_beta.detach().to(device=self.net.device, non_blocking=True).requires_grad_()
+
+    def _set_beta(self, n_fixed_relus, n_unstable_relus, sign_relus, decision, history):
+        assert(len(sign_relus) == n_fixed_relus)
+        # batch = n_fixed_relus + n_unstable_relus
 
 
-    def _init_result_lists(self, decision):
+        #set correct sign for the fixed relus
+        for bi in range(n_fixed_relus): 
+            # Add history splits.
+            d_layer, idx = decision[bi][0], decision[bi][1]
+            # Each history element has format [[[layer 1's split location], [layer 1's split coefficients +1/-1]], [[layer 2's split location], [layer 2's split coefficients +1/-1]], ...].
+            for mi, (split_locs, split_coeffs) in enumerate(history[bi]):
+                split_len = len(split_locs)
+                self.net.relus[mi].sparse_beta_sign[bi, :split_len] = torch.as_tensor(split_coeffs, device='cpu', dtype=torch.get_default_dtype())
+                self.net.relus[mi].sparse_beta_loc[bi, :split_len] = torch.as_tensor(split_locs, device='cpu', dtype=torch.int64)
+                # Add current decision for positive splits.
+                if mi == d_layer:
+                    self.net.relus[mi].sparse_beta_sign[bi, split_len] = sign_relus[bi]
+                    self.net.relus[mi].sparse_beta_loc[bi, split_len] = idx
+
+        #set correct sign for other relus
+        for bi in range(n_fixed_relus, n_fixed_relus + n_unstable_relus): 
+            # Add history splits.
+            d_layer, idx = decision[bi][0], decision[bi][1]
+            # Each history element has format [[[layer 1's split location], [layer 1's split coefficients +1/-1]], [[layer 2's split location], [layer 2's split coefficients +1/-1]], ...].
+            for mi, (split_locs, split_coeffs) in enumerate(history[bi]):
+                split_len = len(split_locs)
+                self.net.relus[mi].sparse_beta_sign[bi, :split_len] = torch.as_tensor(split_coeffs, device='cpu', dtype=torch.get_default_dtype())
+                self.net.relus[mi].sparse_beta_loc[bi, :split_len] = torch.as_tensor(split_locs, device='cpu', dtype=torch.int64)
+                # Add current decision for positive splits.
+                if mi == d_layer:
+                    self.net.relus[mi].sparse_beta_sign[bi, split_len] = 1.0
+                    self.net.relus[mi].sparse_beta_loc[bi, split_len] = idx
+                    self.net.relus[mi].sparse_beta_sign[bi + n_unstable_relus, split_len] = -1.0
+                    self.net.relus[mi].sparse_beta_loc[bi + n_unstable_relus, split_len] = idx
+        
+        # Detach and move to GPU
+        for m in self.net.relus:
+            m.sparse_beta_loc = m.sparse_beta_loc.detach()
+            m.sparse_beta_loc = m.sparse_beta_loc.to(device=self.net.device, non_blocking=True)
+            m.sparse_beta_sign = m.sparse_beta_sign.detach()
+            m.sparse_beta_sign = m.sparse_beta_sign.to(device=self.net.device, non_blocking=True)
+
+
+    def _init_result_lists(self, decision, history):
         """
         There are 2 kinds of decision:
         - decision to split on a relu that is in the pattern
         - decision to split on other relu
+        This function will reorder the decisions so that all fixed relus are at the beginning, and the other relus are at the end
+        Other lists also need to be reorder, like history
         """
         fixed_relus_d = []
+        history_for_fixed_r = []
+
         sign_relus = []
+        history_for_other_relus = []
         other_relus_d = []
 
-        for d in decision:
+        for di, d in enumerate(decision):
             d_layer, d_relu_idx = d
             if d_relu_idx in self.fixed_relu_mask[d_layer][0]:
                 fixed_relus_d.append(d)
                 sign_relus.append(self.fixed_relu_mask[d_layer][1][self.fixed_relu_mask[d_layer][0].index(d_relu_idx)])
+                if history:
+                    history_for_fixed_r.append(history[di])
             else:
                 other_relus_d.append(d)
-
+                if history:
+                    history_for_other_relus.append(history[di])
+        
         reordered_d = fixed_relus_d + other_relus_d
-
+        reordered_his = history_for_fixed_r + history_for_other_relus
 
         n_fixed_relus = len(fixed_relus_d)
         n_unstable_relus = len(other_relus_d)
@@ -434,7 +473,7 @@ class LiRPAConvNetPlus:
         new_split_history = [{} for _ in range(n_fixed_relus + n_unstable_relus * 2)]
         # Each key is corresponding to a pre-relu layer, and each value intermediate beta values for neurons in that layer.
         best_intermediate_betas = [defaultdict(dict) for _ in range(n_fixed_relus + n_unstable_relus * 2)] 
-        return reordered_d, \
+        return reordered_d, reordered_his, n_fixed_relus, n_unstable_relus, \
                 ret_l, ret_u, ret_s, ret_b, \
                 new_split_history, best_intermediate_betas, \
                 sign_relus
@@ -469,10 +508,10 @@ class LiRPAConvNetPlus:
         batch = len(decision)
 
         # initial results with empty list
-        decision, \
+        decision, history, n_fixed_relus, n_unstable_relus, \
         ret_l, ret_u, ret_s, ret_b, \
         new_split_history, best_intermediate_betas, \
-        sign_relus = self._init_result_lists(decision)
+        sign_relus = self._init_result_lists(decision, history)
 
 
 
@@ -489,63 +528,11 @@ class LiRPAConvNetPlus:
             # This is the maximum number of split in each relu neuron for each batch.
             if batch > 0: max_splits_per_layer = splits_per_example.max(dim=0)[0]
 
-            if diving_batch != 0:
-                diving_splits_per_example = torch.zeros(size=(diving_batch, len(self.net.relus)),
-                            dtype=torch.int64, device='cpu', requires_grad=False)
-                for dbi in range(diving_batch):
-                    # diving batch does not have decision splits but only have history splits
-                    for mi, diving_layer_splits in enumerate(history[dbi + batch]):
-                        diving_splits_per_example[dbi, mi] = len(diving_layer_splits[0])  # First element of layer_splits is a list of split neuron IDs.
-
-                # import pdb; pdb.set_trace()
-                splits_per_example = torch.cat([splits_per_example, diving_splits_per_example], dim=0)
-                max_splits_per_layer = splits_per_example.max(dim=0)[0]
-                del diving_splits_per_example
-
             # Create and load warmup beta.
-            self.reset_beta(self.net, batch, betas=betas, max_splits_per_layer=max_splits_per_layer, diving_batch=diving_batch)  # warm start beta
+            self._reset_beta(n_fixed_relus, n_unstable_relus, betas=betas, max_splits_per_layer=max_splits_per_layer, diving_batch=diving_batch)  # warm start beta
 
-            for bi in range(batch):
-                # Add history splits.
-                d, idx = decision[bi][0], decision[bi][1]
-                # Each history element has format [[[layer 1's split location], [layer 1's split coefficients +1/-1]], [[layer 2's split location], [layer 2's split coefficients +1/-1]], ...].
-                for mi, (split_locs, split_coeffs) in enumerate(history[bi]):
-                    split_len = len(split_locs)
-                    self.net.relus[mi].sparse_beta_sign[bi, :split_len] = torch.as_tensor(split_coeffs, device='cpu', dtype=torch.get_default_dtype())
-                    self.net.relus[mi].sparse_beta_loc[bi, :split_len] = torch.as_tensor(split_locs, device='cpu', dtype=torch.int64)
-                    # Add current decision for positive splits.
-                    if mi == d:
-                        self.net.relus[mi].sparse_beta_sign[bi, split_len] = 1.0
-                        self.net.relus[mi].sparse_beta_loc[bi, split_len] = idx
-            # Duplicate split location.
-            for m in self.net.relus:
-                m.sparse_beta_loc = m.sparse_beta_loc.repeat(2, 1).detach()
-                m.sparse_beta_loc = m.sparse_beta_loc.to(device=self.net.device, non_blocking=True)
-                m.sparse_beta_sign = m.sparse_beta_sign.repeat(2, 1).detach()
-            # Fixup the second half of the split (negative splits).
-            for bi in range(batch):
-                d = decision[bi][0]  # layer of this split.
-                split_len = len(history[bi][d][0])  # length of history splits for this example in this layer.
-                self.net.relus[d].sparse_beta_sign[bi + batch, split_len] = -1.0
-            # Transfer tensors to GPU.
-            for m in self.net.relus:
-                m.sparse_beta_sign = m.sparse_beta_sign.to(device=self.net.device, non_blocking=True)
-
-            if diving_batch > 0:
-                # add diving domains history splits, no decision in diving domains
-                for dbi in range(diving_batch):
-                    for mi, (split_locs, split_coeffs) in enumerate(history[dbi + batch]):
-                        split_len = len(split_locs)
-                        self.net.relus[mi].diving_sparse_beta_sign[dbi, :split_len] = torch.as_tensor(split_coeffs, device='cpu', dtype=torch.get_default_dtype())
-                        self.net.relus[mi].diving_sparse_beta_loc[dbi, :split_len] = torch.as_tensor(split_locs, device='cpu', dtype=torch.int64)
-                for m in self.net.relus:
-                    # cat beta loc and sign to have the correct shape
-                    m.diving_sparse_beta_loc = m.diving_sparse_beta_loc.to(device=self.net.device, non_blocking=True)
-                    m.diving_sparse_beta_sign = m.diving_sparse_beta_sign.to(device=self.net.device, non_blocking=True)
-                    m.sparse_beta_loc = torch.cat([m.sparse_beta_loc, m.diving_sparse_beta_loc], dim=0).detach()
-                    m.sparse_beta_sign = torch.cat([m.sparse_beta_sign, m.diving_sparse_beta_sign], dim=0).detach()
-                    # do no need to store the diving beta params any more
-                    del m.diving_sparse_beta_loc, m.diving_sparse_beta_sign
+            # Prepare the sign matrix
+            self._set_beta(n_fixed_relus, n_unstable_relus, sign_relus, decision, history) 
         else:
             for m in self.net.relus:
                 m.beta = None
